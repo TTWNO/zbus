@@ -96,7 +96,7 @@ winapi = { version = "0.3", features = [
   "winerror",
   "winsock2",
 ] }
-uds_windows = "1.0.2"
+uds_windows = { git = "https://github.com/TTWNO/rust_uds_windows", branch = "new_async_io_interfaces" }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.27", default-features = false, features = [
