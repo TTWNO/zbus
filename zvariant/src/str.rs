@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::{Basic, EncodingFormat, Signature, Type};
+use crate::{serialized::Format, Basic, Signature, Type};
 
 /// A string wrapper.
 ///
@@ -125,7 +125,7 @@ impl<'a> Basic for Str<'a> {
     const SIGNATURE_CHAR: char = <&str>::SIGNATURE_CHAR;
     const SIGNATURE_STR: &'static str = <&str>::SIGNATURE_STR;
 
-    fn alignment(format: EncodingFormat) -> usize {
+    fn alignment(format: Format) -> usize {
         <&str>::alignment(format)
     }
 }
@@ -179,8 +179,8 @@ impl<'a> From<Str<'a>> for String {
     }
 }
 
-impl<'a> From<&'a Str<'a>> for &'a str {
-    fn from(value: &'a Str<'a>) -> &'a str {
+impl<'a> From<&'a Str<'_>> for &'a str {
+    fn from(value: &'a Str<'_>) -> &'a str {
         value.as_str()
     }
 }

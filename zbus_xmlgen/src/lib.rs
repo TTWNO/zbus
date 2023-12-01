@@ -169,7 +169,7 @@ fn to_rust_type(ty: &CompleteType, input: bool, as_ref: bool) -> String {
             f64::SIGNATURE_CHAR => "f64".into(),
             // xmlgen accepts 'h' on Windows, only for code generation
             'h' => (if input {
-                "zbus::zvariant::Fd"
+                "zbus::zvariant::Fd<'_>"
             } else {
                 "zbus::zvariant::OwnedFd"
             })
@@ -241,7 +241,7 @@ fn to_rust_type(ty: &CompleteType, input: bool, as_ref: bool) -> String {
                 } else if vec.len() > 1 {
                     format!("{}({})", if as_ref { "&" } else { "" }, vec.join(", "))
                 } else {
-                    vec[0].to_string()
+                    format!("{}({},)", if as_ref { "&" } else { "" }, vec[0])
                 }
             }
             _ => unimplemented!(),
