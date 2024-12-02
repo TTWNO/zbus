@@ -15,7 +15,8 @@ The project is divided into the following subcrates:
 * [`zvariant`] and [`zvariant_derive`]: API for encoding/decoding of data to/from D-Bus wire
   format.
 * [`zbus_names`]: A collection of types for various [D-Bus bus names][dbn].
-* [`zbus_xmlgen`]: A developer tool to generate Rust code from D-Bus XML interface descriptions.
+* [`zbus_xml`]: API to handle D-Bus introspection description XML.
+* [`zbus_xmlgen`]: A developer tool to generate Rust code from D-Bus interface description XML.
 
 ## Getting Started
 
@@ -29,19 +30,19 @@ examples assume that a D-Bus broker is setup on your machine and you've a sessio
 (`DBUS_SESSION_BUS_ADDRESS` environment variable must be set). This is guaranteed to be the case on
 a typical Linux desktop session.
 
-### Server
+### Service
 
 A simple service that politely greets whoever calls its `SayHello` method:
 
 ```rust,no_run
 use std::{error::Error, future::pending};
-use zbus::{connection, dbus_interface};
+use zbus::{connection, interface};
 
 struct Greeter {
     count: u64
 }
 
-#[dbus_interface(name = "org.zbus.MyGreeter1")]
+#[interface(name = "org.zbus.MyGreeter1")]
 impl Greeter {
     // Can be `async` as well.
     fn say_hello(&mut self, name: &str) -> String {
@@ -50,8 +51,8 @@ impl Greeter {
     }
 }
 
-// Although we use `async-std` here, you can use any async runtime of choice.
-#[async_std::main]
+// Although we use `tokio` here, you can use any async runtime of choice.
+#[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let greeter = Greeter { count: 0 };
     let _conn = connection::Builder::session()?
@@ -79,9 +80,9 @@ s "Hello Maria! I have been called 1 times."
 Now let's write the client-side code for `MyGreeter` service:
 
 ```rust,no_run
-use zbus::{Connection, Result, dbus_proxy};
+use zbus::{Connection, Result, proxy};
 
-#[dbus_proxy(
+#[proxy(
     interface = "org.zbus.MyGreeter1",
     default_service = "org.zbus.MyGreeter",
     default_path = "/org/zbus/MyGreeter"
@@ -90,12 +91,12 @@ trait MyGreeter {
     async fn say_hello(&self, name: &str) -> Result<String>;
 }
 
-// Although we use `async-std` here, you can use any async runtime of choice.
-#[async_std::main]
+// Although we use `tokio` here, you can use any async runtime of choice.
+#[tokio::main]
 async fn main() -> Result<()> {
     let connection = Connection::session().await?;
 
-    // `dbus_proxy` macro creates `MyGreeterProxy` based on `Notifications` trait.
+    // `proxy` macro creates `MyGreeterProxy` based on `Notifications` trait.
     let proxy = MyGreeterProxy::new(&connection).await?;
     let reply = proxy.say_hello("Maria").await?;
     println!("{reply}");
@@ -131,6 +132,7 @@ There are many other D-Bus crates out there with various levels of maturity and 
 [`zbus`]: zbus/README.md
 [`zbus_macros`]: zbus_macros/README.md
 [`zbus_names`]: zbus_names/README.md
+[`zbus_xml`]: zbus_xml/README.md
 [`zbus_xmlgen`]: zbus_xmlgen/README.md
 [`zvariant`]: zvariant/README.md
 [`zvariant_derive`]: zvariant_derive/README.md

@@ -1,17 +1,18 @@
 #![deny(rust_2018_idioms)]
 #![doc(
-    html_logo_url = "https://storage.googleapis.com/fdo-gitlab-uploads/project/avatar/3213/zbus-logomark.png"
+    html_logo_url = "https://raw.githubusercontent.com/dbus2/zbus/9f7a90d2b594ddc48b7a5f39fda5e00cd56a7dfb/logo.png"
 )]
 #![doc = include_str!("../README.md")]
 #![doc(test(attr(
     warn(unused),
     deny(warnings),
+    allow(dead_code),
     // W/o this, we seem to get some bogus warning about `extern crate zbus`.
     allow(unused_extern_crates),
 )))]
 
 use proc_macro::TokenStream;
-use syn::{self, DeriveInput};
+use syn::DeriveInput;
 
 mod dict;
 mod r#type;
@@ -25,9 +26,8 @@ mod value;
 /// For structs it works just like serde's [`Serialize`] and [`Deserialize`] macros:
 ///
 /// ```
-/// use zvariant::{EncodingContext, from_slice, to_bytes, Type};
+/// use zvariant::{serialized::Context, to_bytes, Type, LE};
 /// use serde::{Deserialize, Serialize};
-/// use byteorder::LE;
 ///
 /// #[derive(Deserialize, Serialize, Type, PartialEq, Debug)]
 /// struct Struct<'s> {
@@ -36,15 +36,15 @@ mod value;
 ///     field3: &'s str,
 /// }
 ///
-/// assert_eq!(Struct::signature(), "(qxs)");
+/// assert_eq!(Struct::SIGNATURE, "(qxs)");
 /// let s = Struct {
 ///     field1: 42,
 ///     field2: i64::max_value(),
 ///     field3: "hello",
 /// };
-/// let ctxt = EncodingContext::<LE>::new_dbus(0);
+/// let ctxt = Context::new_dbus(LE, 0);
 /// let encoded = to_bytes(ctxt, &s).unwrap();
-/// let decoded: Struct = from_slice(&encoded, ctxt).unwrap().0;
+/// let decoded: Struct = encoded.deserialize().unwrap().0;
 /// assert_eq!(decoded, s);
 /// ```
 ///
@@ -53,10 +53,9 @@ mod value;
 /// `repr` attribute (like in the example below), you'll also need [serde_repr] crate.
 ///
 /// ```
-/// use zvariant::{EncodingContext, from_slice, to_bytes, Type};
+/// use zvariant::{serialized::Context, to_bytes, Type, LE};
 /// use serde::{Deserialize, Serialize};
 /// use serde_repr::{Deserialize_repr, Serialize_repr};
-/// use byteorder::LE;
 ///
 /// #[repr(u8)]
 /// #[derive(Deserialize_repr, Serialize_repr, Type, Debug, PartialEq)]
@@ -64,10 +63,10 @@ mod value;
 ///     Variant1,
 ///     Variant2,
 /// }
-/// assert_eq!(Enum::signature(), u8::signature());
-/// let ctxt = EncodingContext::<LE>::new_dbus(0);
+/// assert_eq!(Enum::SIGNATURE, u8::SIGNATURE);
+/// let ctxt = Context::new_dbus(LE, 0);
 /// let encoded = to_bytes(ctxt, &Enum::Variant2).unwrap();
-/// let decoded: Enum = from_slice(&encoded, ctxt).unwrap().0;
+/// let decoded: Enum = encoded.deserialize().unwrap().0;
 /// assert_eq!(decoded, Enum::Variant2);
 ///
 /// #[repr(i64)]
@@ -76,7 +75,7 @@ mod value;
 ///     Variant1,
 ///     Variant2,
 /// }
-/// assert_eq!(Enum2::signature(), i64::signature());
+/// assert_eq!(Enum2::SIGNATURE, i64::SIGNATURE);
 ///
 /// // w/o repr attribute, u32 representation is chosen
 /// #[derive(Deserialize, Serialize, Type)]
@@ -84,7 +83,7 @@ mod value;
 ///     Variant1,
 ///     Variant2,
 /// }
-/// assert_eq!(NoReprEnum::signature(), u32::signature());
+/// assert_eq!(NoReprEnum::SIGNATURE, u32::SIGNATURE);
 ///
 /// // Not-unit enums are represented as a structure, with the first field being a u32 denoting the
 /// // variant and the second as the actual value.
@@ -93,14 +92,14 @@ mod value;
 ///     Variant1(f64),
 ///     Variant2(f64),
 /// }
-/// assert_eq!(NewType::signature(), "(ud)");
+/// assert_eq!(NewType::SIGNATURE, "(ud)");
 ///
 /// #[derive(Deserialize, Serialize, Type)]
 /// enum StructFields {
 ///     Variant1(u16, i64, &'static str),
 ///     Variant2 { field1: u16, field2: i64, field3: &'static str },
 /// }
-/// assert_eq!(StructFields::signature(), "(u(qxs))");
+/// assert_eq!(StructFields::SIGNATURE, "(u(qxs))");
 /// ```
 ///
 /// # Custom signatures
@@ -111,8 +110,7 @@ mod value;
 /// an alias for `a{sv}`. Here is an example:
 ///
 /// ```
-/// use zvariant::{SerializeDict, DeserializeDict, EncodingContext, from_slice, to_bytes, Type};
-/// use byteorder::LE;
+/// use zvariant::{SerializeDict, DeserializeDict, serialized::Context, to_bytes, Type, LE};
 ///
 /// #[derive(DeserializeDict, SerializeDict, Type, PartialEq, Debug)]
 /// // `#[zvariant(signature = "a{sv}")]` would be the same.
@@ -123,24 +121,23 @@ mod value;
 ///     field3: String,
 /// }
 ///
-/// assert_eq!(Struct::signature(), "a{sv}");
+/// assert_eq!(Struct::SIGNATURE, "a{sv}");
 /// let s = Struct {
 ///     field1: 42,
 ///     field2: i64::max_value(),
 ///     field3: "hello".to_string(),
 /// };
-/// let ctxt = EncodingContext::<LE>::new_dbus(0);
+/// let ctxt = Context::new_dbus(LE, 0);
 /// let encoded = to_bytes(ctxt, &s).unwrap();
-/// let decoded: Struct = from_slice(&encoded, ctxt).unwrap().0;
+/// let decoded: Struct = encoded.deserialize().unwrap().0;
 /// assert_eq!(decoded, s);
 /// ```
 ///
 /// Another common use for custom signatures is (de)serialization of unit enums as strings:
 ///
 /// ```
-/// use zvariant::{EncodingContext, from_slice, to_bytes, Type};
+/// use zvariant::{serialized::Context, to_bytes, Type, LE};
 /// use serde::{Deserialize, Serialize};
-/// use byteorder::LE;
 ///
 /// #[derive(Deserialize, Serialize, Type, PartialEq, Debug)]
 /// #[zvariant(signature = "s")]
@@ -150,11 +147,11 @@ mod value;
 ///     Variant3,
 /// }
 ///
-/// assert_eq!(StrEnum::signature(), "s");
-/// let ctxt = EncodingContext::<LE>::new_dbus(0);
+/// assert_eq!(StrEnum::SIGNATURE, "s");
+/// let ctxt = Context::new_dbus(LE, 0);
 /// let encoded = to_bytes(ctxt, &StrEnum::Variant2).unwrap();
 /// assert_eq!(encoded.len(), 13);
-/// let decoded: StrEnum = from_slice(&encoded, ctxt).unwrap().0;
+/// let decoded: StrEnum = encoded.deserialize().unwrap().0;
 /// assert_eq!(decoded, StrEnum::Variant2);
 /// ```
 ///
@@ -162,7 +159,7 @@ mod value;
 /// [`Serialize`]: https://docs.serde.rs/serde/trait.Serialize.html
 /// [`Deserialize`]: https://docs.serde.rs/serde/de/trait.Deserialize.html
 /// [serde_repr]: https://crates.io/crates/serde_repr
-#[proc_macro_derive(Type, attributes(zvariant))]
+#[proc_macro_derive(Type, attributes(zbus, zvariant))]
 pub fn type_macro_derive(input: TokenStream) -> TokenStream {
     let ast: DeriveInput = syn::parse(input).unwrap();
     r#type::expand_derive(ast)
@@ -227,9 +224,10 @@ pub fn type_macro_derive(input: TokenStream) -> TokenStream {
 /// * `"PascalCase"`
 /// * `"camelCase"`
 /// * `"snake_case"`
+/// * `"kebab-case"`
 ///
 /// [`Serialize`]: https://docs.serde.rs/serde/trait.Serialize.html
-#[proc_macro_derive(SerializeDict, attributes(zvariant))]
+#[proc_macro_derive(SerializeDict, attributes(zbus, zvariant))]
 pub fn serialize_dict_macro_derive(input: TokenStream) -> TokenStream {
     let input: DeriveInput = syn::parse(input).unwrap();
     dict::expand_serialize_derive(input)
@@ -295,9 +293,10 @@ pub fn serialize_dict_macro_derive(input: TokenStream) -> TokenStream {
 /// * `"PascalCase"`
 /// * `"camelCase"`
 /// * `"snake_case"`
+/// * `"kebab-case"`
 ///
 /// [`Deserialize`]: https://docs.serde.rs/serde/de/trait.Deserialize.html
-#[proc_macro_derive(DeserializeDict, attributes(zvariant))]
+#[proc_macro_derive(DeserializeDict, attributes(zbus, zvariant))]
 pub fn deserialize_dict_macro_derive(input: TokenStream) -> TokenStream {
     let input: DeriveInput = syn::parse(input).unwrap();
     dict::expand_deserialize_derive(input)
@@ -328,7 +327,7 @@ pub fn deserialize_dict_macro_derive(input: TokenStream) -> TokenStream {
 /// };
 /// let value = Value::from(s.clone());
 /// let _ = OwnedStruct::try_from(value).unwrap();
-/// let value = OwnedValue::from(s);
+/// let value = OwnedValue::try_from(s).unwrap();
 /// let s = OwnedStruct::try_from(value).unwrap();
 /// assert_eq!(s.owned_str, "hi");
 /// assert_eq!(s.owned_path.as_str(), "/blah");
@@ -354,7 +353,7 @@ pub fn deserialize_dict_macro_derive(input: TokenStream) -> TokenStream {
 /// let value = Value::from(s.clone());
 /// let s = UnownedStruct::try_from(value).unwrap();
 ///
-/// let value = OwnedValue::from(s);
+/// let value = OwnedValue::try_from(s).unwrap();
 /// let s = UnownedStruct::try_from(value).unwrap();
 /// assert_eq!(s.s, "hi");
 /// assert_eq!(s.path, "/blah");
@@ -377,7 +376,7 @@ pub fn deserialize_dict_macro_derive(input: TokenStream) -> TokenStream {
 /// };
 /// let value = Value::from(s.clone());
 /// let _ = GenericStruct::<String, OwnedObjectPath>::try_from(value).unwrap();
-/// let value = OwnedValue::from(s);
+/// let value = OwnedValue::try_from(s).unwrap();
 /// let s = GenericStruct::<String, OwnedObjectPath>::try_from(value).unwrap();
 /// assert_eq!(s.field1, "hi");
 /// assert_eq!(s.field2.as_str(), "/blah");
@@ -398,7 +397,7 @@ pub fn deserialize_dict_macro_derive(input: TokenStream) -> TokenStream {
 /// let value = Value::from(Enum::Variant1);
 /// let e = Enum::try_from(value).unwrap();
 /// assert_eq!(e, Enum::Variant1);
-/// let value = OwnedValue::from(Enum::Variant2);
+/// let value = OwnedValue::try_from(Enum::Variant2).unwrap();
 /// let e = Enum::try_from(value).unwrap();
 /// assert_eq!(e, Enum::Variant2);
 /// ```
@@ -421,7 +420,7 @@ pub fn value_macro_derive(input: TokenStream) -> TokenStream {
 
 /// Implements conversions for your type to/from [`OwnedValue`].
 ///
-/// Implements `TryFrom<OwnedValue>` and `Into<OwnedValue>` for your type.
+/// Implements `TryFrom<OwnedValue>` and `TryInto<OwnedValue>` for your type.
 ///
 /// See [`Value`] documentation for examples.
 ///

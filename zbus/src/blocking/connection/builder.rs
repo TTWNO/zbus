@@ -7,18 +7,16 @@ use std::os::unix::net::UnixStream;
 use tokio::net::TcpStream;
 #[cfg(all(unix, feature = "tokio"))]
 use tokio::net::UnixStream;
-#[cfg(windows)]
+#[cfg(all(windows, not(feature = "tokio")))]
 use uds_windows::UnixStream;
 
-use zvariant::{ObjectPath, Str};
+use zvariant::ObjectPath;
 
+#[cfg(feature = "p2p")]
+use crate::Guid;
 use crate::{
-    address::Address,
-    blocking::Connection,
-    names::{UniqueName, WellKnownName},
-    object_server::Interface,
-    utils::block_on,
-    AuthMechanism, Error, Guid, Result,
+    address::Address, blocking::Connection, conn::AuthMechanism, connection::socket::BoxedSplit,
+    names::WellKnownName, object_server::Interface, utils::block_on, Error, Result,
 };
 
 /// A builder for [`zbus::blocking::Connection`].
@@ -39,7 +37,7 @@ impl<'a> Builder<'a> {
         crate::connection::Builder::system().map(Self)
     }
 
-    /// Create a builder for connection that will use the given [D-Bus bus address].
+    /// Create a builder for a connection that will use the given [D-Bus bus address].
     ///
     /// [D-Bus bus address]: https://dbus.freedesktop.org/doc/dbus-specification.html#addresses
     pub fn address<A>(address: A) -> Result<Self>
@@ -50,57 +48,57 @@ impl<'a> Builder<'a> {
         crate::connection::Builder::address(address).map(Self)
     }
 
-    /// Create a builder for connection that will use the given unix stream.
+    /// Create a builder for a connection that will use the given unix stream.
     ///
-    /// If the default `async-io` feature is disabled, this method will expect
+    /// If the default `async-io` feature is disabled, this method will expect a
     /// [`tokio::net::UnixStream`](https://docs.rs/tokio/latest/tokio/net/struct.UnixStream.html)
     /// argument.
+    ///
+    /// Since tokio currently [does not support Unix domain sockets][tuds] on Windows, this method
+    /// is not available when the `tokio` feature is enabled and building for Windows target.
+    ///
+    /// [tuds]: https://github.com/tokio-rs/tokio/issues/2201
+    #[cfg(any(unix, not(feature = "tokio")))]
     pub fn unix_stream(stream: UnixStream) -> Self {
         Self(crate::connection::Builder::unix_stream(stream))
     }
 
-    /// Create a builder for connection that will use the given TCP stream.
+    /// Create a builder for a connection that will use the given TCP stream.
     ///
-    /// If the default `async-io` feature is disabled, this method will expect
+    /// If the default `async-io` feature is disabled, this method will expect a
     /// [`tokio::net::TcpStream`](https://docs.rs/tokio/latest/tokio/net/struct.TcpStream.html)
     /// argument.
     pub fn tcp_stream(stream: TcpStream) -> Self {
         Self(crate::connection::Builder::tcp_stream(stream))
     }
 
-    /// Specify the mechanisms to use during authentication.
-    pub fn auth_mechanisms(self, auth_mechanisms: &[AuthMechanism]) -> Self {
-        Self(self.0.auth_mechanisms(auth_mechanisms))
-    }
-
-    /// The cookie context to use during authentication.
+    /// Create a builder for a connection that will use the given pre-authenticated socket.
     ///
-    /// This is only used when the `cookie` authentication mechanism is enabled and only valid for
-    /// server connection.
-    ///
-    /// If not specified, the default cookie context of `org_freedesktop_general` will be used.
-    ///
-    /// # Errors
-    ///
-    /// If the given string is not a valid cookie context.
-    pub fn cookie_context<C>(self, context: C) -> Result<Self>
+    /// This is similar to [`Builder::socket`], except that the socket is either already
+    /// authenticated or does not require authentication.
+    pub fn authenticated_socket<S, G>(socket: S, guid: G) -> Result<Self>
     where
-        C: Into<Str<'a>>,
+        S: Into<BoxedSplit>,
+        G: TryInto<crate::Guid<'a>>,
+        G::Error: Into<Error>,
     {
-        self.0.cookie_context(context).map(Self)
+        crate::connection::Builder::authenticated_socket(socket, guid).map(Self)
     }
 
-    /// The ID of the cookie to use during authentication.
-    ///
-    /// This is only used when the `cookie` authentication mechanism is enabled and only valid for
-    /// server connection.
-    ///
-    /// If not specified, the first cookie found in the cookie context file will be used.
-    pub fn cookie_id(self, id: usize) -> Self {
-        Self(self.0.cookie_id(id))
+    /// Create a builder for a connection that will use the given socket.
+    pub fn socket<S: Into<BoxedSplit>>(socket: S) -> Self {
+        Self(crate::connection::Builder::socket(socket))
+    }
+
+    /// Specify the mechanism to use during authentication.
+    pub fn auth_mechanism(self, auth_mechanism: AuthMechanism) -> Self {
+        Self(self.0.auth_mechanism(auth_mechanism))
     }
 
     /// The to-be-created connection will be a peer-to-peer connection.
+    ///
+    /// This method is only available when the `p2p` feature is enabled.
+    #[cfg(feature = "p2p")]
     pub fn p2p(self) -> Self {
         Self(self.0.p2p())
     }
@@ -109,8 +107,19 @@ impl<'a> Builder<'a> {
     ///
     /// The to-be-created connection will wait for incoming client authentication handshake and
     /// negotiation messages, for peer-to-peer communications after successful creation.
-    pub fn server(self, guid: &'a Guid) -> Self {
-        Self(self.0.server(guid))
+    ///
+    /// This method is only available when the `p2p` feature is enabled.
+    ///
+    /// **NOTE:** This method is redundant when using [`Builder::authenticated_socket`] since the
+    /// latter already sets the GUID for the connection and zbus doesn't differentiate between a
+    /// server and a client connection, except for authentication.
+    #[cfg(feature = "p2p")]
+    pub fn server<G>(self, guid: G) -> Result<Self>
+    where
+        G: TryInto<Guid<'a>>,
+        G::Error: Into<Error>,
+    {
+        self.0.server(guid).map(Self)
     }
 
     /// Set the capacity of the main (unfiltered) queue.
@@ -165,7 +174,9 @@ impl<'a> Builder<'a> {
         self.0.name(well_known_name).map(Self)
     }
 
-    /// Sets the unique name of the connection.
+    /// Set the unique name of the connection.
+    ///
+    /// This method is only available when the `bus-impl` feature is enabled.
     ///
     /// # Panics
     ///
@@ -173,9 +184,10 @@ impl<'a> Builder<'a> {
     /// It will always panic if the connection is to a message bus as it's the bus that assigns
     /// peers their unique names. This is mainly provided for bus implementations. All other users
     /// should not need to use this method.
+    #[cfg(feature = "bus-impl")]
     pub fn unique_name<U>(self, unique_name: U) -> Result<Self>
     where
-        U: TryInto<UniqueName<'a>>,
+        U: TryInto<crate::names::UniqueName<'a>>,
         U::Error: Into<Error>,
     {
         self.0.unique_name(unique_name).map(Self)
@@ -186,7 +198,7 @@ impl<'a> Builder<'a> {
     /// # Errors
     ///
     /// Until server-side bus connection is supported, attempting to build such a connection will
-    /// result in [`Error::Unsupported`] error.
+    /// result in a [`Error::Unsupported`] error.
     pub fn build(self) -> Result<Connection> {
         block_on(self.0.build()).map(Into::into)
     }

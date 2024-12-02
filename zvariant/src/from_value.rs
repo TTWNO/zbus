@@ -1,8 +1,8 @@
 #[cfg(feature = "gvariant")]
 use crate::Maybe;
 use crate::{
-    Array, Dict, Error, NoneValue, ObjectPath, Optional, OwnedObjectPath, OwnedSignature,
-    Signature, Str, Structure, Value,
+    Array, Dict, Error, NoneValue, ObjectPath, Optional, OwnedObjectPath, Signature, Str,
+    Structure, Value,
 };
 
 #[cfg(unix)]
@@ -28,10 +28,10 @@ macro_rules! value_try_from {
 
 macro_rules! value_try_from_ref {
     ($kind:ident, $to:ty) => {
-        impl<'a> TryFrom<&'a Value<'a>> for &'a $to {
+        impl<'a> TryFrom<&'a Value<'_>> for &'a $to {
             type Error = Error;
 
-            fn try_from(value: &'a Value<'a>) -> Result<Self, Self::Error> {
+            fn try_from(value: &'a Value<'_>) -> Result<Self, Self::Error> {
                 if let Value::$kind(value) = value {
                     Ok(value)
                 } else {
@@ -44,10 +44,10 @@ macro_rules! value_try_from_ref {
 
 macro_rules! value_try_from_ref_clone {
     ($kind:ident, $to:ty) => {
-        impl<'a> TryFrom<&'a Value<'a>> for $to {
+        impl<'a> TryFrom<&Value<'a>> for $to {
             type Error = Error;
 
-            fn try_from(value: &'a Value<'_>) -> Result<Self, Self::Error> {
+            fn try_from(value: &Value<'a>) -> Result<Self, Self::Error> {
                 if let Value::$kind(value) = value {
                     Ok(value.clone().into())
                 } else {
@@ -75,25 +75,59 @@ value_try_from_all!(U32, u32);
 value_try_from_all!(I64, i64);
 value_try_from_all!(U64, u64);
 value_try_from_all!(F64, f64);
-#[cfg(unix)]
-value_try_from_all!(Fd, Fd);
 
 value_try_from_all!(Str, Str<'a>);
-value_try_from_all!(Signature, Signature<'a>);
+value_try_from_all!(Signature, Signature);
 value_try_from_all!(ObjectPath, ObjectPath<'a>);
-value_try_from_all!(Structure, Structure<'a>);
-value_try_from_all!(Dict, Dict<'a, 'a>);
-value_try_from_all!(Array, Array<'a>);
-#[cfg(feature = "gvariant")]
-value_try_from_all!(Maybe, Maybe<'a>);
-
 value_try_from!(Str, String);
 value_try_from_ref!(Str, str);
 
-impl<'a> TryFrom<&'a Value<'a>> for String {
+macro_rules! value_try_from_ref_try_clone {
+    ($kind:ident, $to:ty) => {
+        impl<'a> TryFrom<&Value<'a>> for $to {
+            type Error = Error;
+
+            fn try_from(value: &Value<'a>) -> Result<Self, Self::Error> {
+                if let Value::$kind(value) = value {
+                    value.try_clone().map_err(Into::into)
+                } else {
+                    Err(Error::IncorrectType)
+                }
+            }
+        }
+    };
+}
+
+value_try_from!(Structure, Structure<'a>);
+value_try_from_ref!(Structure, Structure<'a>);
+value_try_from_ref_try_clone!(Structure, Structure<'a>);
+
+value_try_from!(Dict, Dict<'a, 'a>);
+value_try_from_ref!(Dict, Dict<'a, 'a>);
+value_try_from_ref_try_clone!(Dict, Dict<'a, 'a>);
+
+value_try_from!(Array, Array<'a>);
+value_try_from_ref!(Array, Array<'a>);
+value_try_from_ref_try_clone!(Array, Array<'a>);
+
+#[cfg(feature = "gvariant")]
+value_try_from!(Maybe, Maybe<'a>);
+#[cfg(feature = "gvariant")]
+value_try_from_ref!(Maybe, Maybe<'a>);
+#[cfg(feature = "gvariant")]
+value_try_from_ref_try_clone!(Maybe, Maybe<'a>);
+
+#[cfg(unix)]
+value_try_from!(Fd, Fd<'a>);
+#[cfg(unix)]
+value_try_from_ref!(Fd, Fd<'a>);
+#[cfg(unix)]
+value_try_from_ref_try_clone!(Fd, Fd<'a>);
+
+impl TryFrom<&Value<'_>> for String {
     type Error = Error;
 
-    fn try_from(value: &'a Value<'_>) -> Result<Self, Self::Error> {
+    fn try_from(value: &Value<'_>) -> Result<Self, Self::Error> {
         Ok(<&str>::try_from(value)?.into())
     }
 }
@@ -119,14 +153,6 @@ impl TryFrom<Value<'_>> for OwnedObjectPath {
 
     fn try_from(value: Value<'_>) -> Result<Self, Self::Error> {
         ObjectPath::try_from(value).map(OwnedObjectPath::from)
-    }
-}
-
-impl TryFrom<Value<'_>> for OwnedSignature {
-    type Error = Error;
-
-    fn try_from(value: Value<'_>) -> Result<Self, Self::Error> {
-        Signature::try_from(value).map(OwnedSignature::from)
     }
 }
 

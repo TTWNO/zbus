@@ -20,7 +20,8 @@ fn dict_name_for_field(
             Some("UPPERCASE") => Ok(ident.to_ascii_uppercase()),
             Some("PascalCase") => Ok(case::pascal_or_camel_case(&ident, true)),
             Some("camelCase") => Ok(case::pascal_or_camel_case(&ident, false)),
-            Some("snake_case") => Ok(case::snake_case(&ident)),
+            Some("snake_case") => Ok(case::snake_or_kebab_case(&ident, true)),
+            Some("kebab-case") => Ok(case::snake_or_kebab_case(&ident, false)),
             None => Ok(ident),
             Some(other) => Err(Error::new(
                 f.span(),
@@ -154,7 +155,7 @@ pub fn expand_deserialize_derive(input: DeriveInput) -> Result<TokenStream, Erro
 
     let (_, ty_generics, _) = input.generics.split_for_impl();
     let mut generics = input.generics.clone();
-    let def = syn::LifetimeDef {
+    let def = syn::LifetimeParam {
         attrs: Vec::new(),
         lifetime: syn::Lifetime::new("'de", Span::call_site()),
         colon_token: None,

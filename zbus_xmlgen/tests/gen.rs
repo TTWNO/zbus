@@ -1,5 +1,5 @@
 use pretty_assertions::assert_eq;
-use std::{env, error::Error, io::Write, path::Path, result::Result};
+use std::{env, error::Error, io::Write, path::Path};
 
 use zbus_xml::Node;
 use zbus_xmlgen::GenTrait;
@@ -15,6 +15,7 @@ macro_rules! gen_diff {
             interface: &node.interfaces()[0],
             path: None,
             service: None,
+            format: true,
         }
         .to_string();
 

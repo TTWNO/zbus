@@ -9,8 +9,7 @@ use crate::{
 ///
 /// Just like [`crate::MessageStream`] must be continuously polled, you must continuously iterate
 /// over this type until it's consumed or dropped.
-#[derive(derivative::Derivative, Clone)]
-#[derivative(Debug)]
+#[derive(Debug, Clone)]
 pub struct MessageIterator {
     // Wrap it in an `Option` to ensure the stream is dropped in a `block_on` call. This is needed
     // for tokio because the proxy spawns a task in its `Drop` impl and that needs a runtime
@@ -68,11 +67,11 @@ impl MessageIterator {
     /// );
     ///
     /// // We register 2 names, starting with the uninteresting one. If `iter` wasn't filtering
-    /// // messages based on the match rule, we'd receive method return call for each of these 2
+    /// // messages based on the match rule, we'd receive method return calls for each of these 2
     /// // calls first.
     /// //
-    /// // Note that the `NameOwnerChanged` signal will not be sent by the bus  for the first name
-    /// // we register since we setup an arg filter.
+    /// // Note that the `NameOwnerChanged` signal will not be sent by the bus for the first name
+    /// // we register since we set up an arg filter.
     /// conn.request_name("org.freedesktop.zbus.MatchRuleIteratorTest44")?;
     /// conn.request_name("org.freedesktop.zbus.MatchRuleIteratorTest42")?;
     ///

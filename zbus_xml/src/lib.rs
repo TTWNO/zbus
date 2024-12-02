@@ -1,11 +1,12 @@
 #![deny(rust_2018_idioms)]
 #![doc(
-    html_logo_url = "https://storage.googleapis.com/fdo-gitlab-uploads/project/avatar/3213/zbus-logomark.png"
+    html_logo_url = "https://raw.githubusercontent.com/dbus2/zbus/9f7a90d2b594ddc48b7a5f39fda5e00cd56a7dfb/logo.png"
 )]
 #![doc = include_str!("../README.md")]
 #![doc(test(attr(
     warn(unused),
     deny(warnings),
+    allow(dead_code),
     // W/o this, we seem to get some bogus warning about `extern crate zbus`.
     allow(unused_extern_crates),
 )))]
@@ -16,10 +17,12 @@ pub use error::{Error, Result};
 use quick_xml::{de::Deserializer, se::to_writer};
 use serde::{Deserialize, Serialize};
 use static_assertions::assert_impl_all;
-use std::io::{BufReader, Read, Write};
+use std::{
+    io::{BufReader, Read, Write},
+    ops::Deref,
+};
 
-use zbus_names::{InterfaceName, MemberName};
-use zvariant::CompleteType;
+use zbus_names::{InterfaceName, MemberName, PropertyName};
 
 /// Annotations are generic key/value pairs of metadata.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -55,27 +58,27 @@ pub enum ArgDirection {
 
 /// An argument
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
-pub struct Arg<'a> {
+pub struct Arg {
     #[serde(rename = "@name")]
     name: Option<String>,
-    #[serde(rename = "@type", borrow)]
-    ty: CompleteType<'a>,
+    #[serde(rename = "@type")]
+    ty: Signature,
     #[serde(rename = "@direction")]
     direction: Option<ArgDirection>,
     #[serde(rename = "annotation", default)]
     annotations: Vec<Annotation>,
 }
 
-assert_impl_all!(Arg<'_>: Send, Sync, Unpin);
+assert_impl_all!(Arg: Send, Sync, Unpin);
 
-impl<'a> Arg<'a> {
+impl Arg {
     /// Return the argument name, if any.
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
 
     /// Return the argument type.
-    pub fn ty(&self) -> &CompleteType<'a> {
+    pub fn ty(&self) -> &Signature {
         &self.ty
     }
 
@@ -95,8 +98,8 @@ impl<'a> Arg<'a> {
 pub struct Method<'a> {
     #[serde(rename = "@name", borrow)]
     name: MemberName<'a>,
-    #[serde(rename = "arg", default, borrow)]
-    args: Vec<Arg<'a>>,
+    #[serde(rename = "arg", default)]
+    args: Vec<Arg>,
     #[serde(rename = "annotation", default)]
     annotations: Vec<Annotation>,
 }
@@ -110,7 +113,7 @@ impl<'a> Method<'a> {
     }
 
     /// Return the method arguments.
-    pub fn args(&self) -> &[Arg<'a>] {
+    pub fn args(&self) -> &[Arg] {
         &self.args
     }
 
@@ -127,7 +130,7 @@ pub struct Signal<'a> {
     name: MemberName<'a>,
 
     #[serde(rename = "arg", default)]
-    args: Vec<Arg<'a>>,
+    args: Vec<Arg>,
     #[serde(rename = "annotation", default)]
     annotations: Vec<Annotation>,
 }
@@ -141,7 +144,7 @@ impl<'a> Signal<'a> {
     }
 
     /// Return the signal arguments.
-    pub fn args(&self) -> &[Arg<'a>] {
+    pub fn args(&self) -> &[Arg] {
         &self.args
     }
 
@@ -176,10 +179,10 @@ impl PropertyAccess {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct Property<'a> {
     #[serde(rename = "@name", borrow)]
-    name: MemberName<'a>,
+    name: PropertyName<'a>,
 
     #[serde(rename = "@type")]
-    ty: CompleteType<'a>,
+    ty: Signature,
     #[serde(rename = "@access")]
     access: PropertyAccess,
 
@@ -191,12 +194,12 @@ assert_impl_all!(Property<'_>: Send, Sync, Unpin);
 
 impl<'a> Property<'a> {
     /// Returns the property name.
-    pub fn name(&self) -> MemberName<'_> {
+    pub fn name(&self) -> PropertyName<'_> {
         self.name.as_ref()
     }
 
     /// Returns the property type.
-    pub fn ty(&self) -> &CompleteType<'a> {
+    pub fn ty(&self) -> &Signature {
         &self.ty
     }
 
@@ -321,5 +324,51 @@ impl<'a> TryFrom<&'a str> for Node<'a> {
         let mut deserializer = Deserializer::from_str(s);
         deserializer.event_buffer_size(Some(1024_usize.try_into().unwrap()));
         Ok(Node::deserialize(&mut deserializer)?)
+    }
+}
+
+/// A thin wrapper around `zvariant::parsed::Signature`.
+///
+/// This is to allow `Signature` to be deserialized from an owned string, which is what quick-xml2
+/// deserializer does.
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub struct Signature(zvariant::Signature);
+
+impl Signature {
+    /// Return the inner `zvariant::Signature`.
+    pub fn inner(&self) -> &zvariant::Signature {
+        &self.0
+    }
+
+    /// Convert this `Signature` into the inner `zvariant::parsed::Signature`.
+    pub fn into_inner(self) -> zvariant::Signature {
+        self.0
+    }
+}
+
+impl<'de> serde::de::Deserialize<'de> for Signature {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).and_then(|s| {
+            zvariant::Signature::try_from(s.as_bytes())
+                .map_err(serde::de::Error::custom)
+                .map(Signature)
+        })
+    }
+}
+
+impl Deref for Signature {
+    type Target = zvariant::Signature;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner()
+    }
+}
+
+impl PartialEq<str> for Signature {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
     }
 }

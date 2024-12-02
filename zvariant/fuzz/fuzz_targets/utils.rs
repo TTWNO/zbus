@@ -1,8 +1,11 @@
-use byteorder::ByteOrder;
-use zvariant::{from_slice, to_bytes, EncodingContext as Context, Value};
+use zvariant::{
+    serialized::{Context, Data},
+    to_bytes, Value,
+};
 
-pub fn fuzz_for_context<B: ByteOrder>(data: &[u8], ctx: Context<B>) {
-    if let Ok((decoded, _)) = from_slice::<_, Value>(data, ctx) {
+pub fn fuzz_for_context(bytes: &[u8], ctx: Context) {
+    let data = Data::new(bytes, ctx);
+    if let Ok((decoded, _)) = data.deserialize::<Value>() {
         to_bytes(ctx, &decoded).unwrap();
     }
 }

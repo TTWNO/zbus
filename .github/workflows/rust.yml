@@ -7,56 +7,67 @@ on:
     branches: [main]
 
 jobs:
-  MSRV:
-    runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: -D warnings
-      MSRV: 1.66.0
-    steps:
-      - uses: actions/checkout@v3
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.MSRV }}
-          targets: x86_64-pc-windows-gnu, x86_64-apple-darwin, x86_64-unknown-freebsd, x86_64-unknown-netbsd
-          components: rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: Check build with MSRV
-        run: |
-          cargo check
-          cargo check --target x86_64-pc-windows-gnu
-          cargo check --target x86_64-apple-darwin
-          cargo check --target x86_64-unknown-freebsd
-          cargo check --target x86_64-unknown-netbsd
-        # This would be nice but some optional deps (e.g `time`) move very fast wrt to MSRV.
-        # cargo check --all-features
-
-  lint:
+  fmt:
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -D warnings
       RUST_BACKTRACE: full
       RUST_LOG: trace
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          # We use some nightly fmt options.
+          toolchain: nightly
+          components: rustfmt
+          targets: x86_64-apple-darwin, x86_64-unknown-freebsd, x86_64-unknown-netbsd x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: |
+          cargo --locked fmt -- --check
+          cargo --locked check --target x86_64-apple-darwin
+          cargo --locked check --target x86_64-unknown-freebsd
+          cargo --locked check --target x86_64-unknown-netbsd
+          cargo --locked check --target x86_64-pc-windows-gnu
+
+  clippy:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+      RUST_BACKTRACE: full
+      RUST_LOG: trace
+    steps:
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
-          components: clippy, rustfmt
+          components: clippy
+          targets: x86_64-apple-darwin, x86_64-unknown-freebsd, x86_64-unknown-netbsd x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@v2
-      - name: Check formatting
-        run: cargo fmt -- --check
       - name: Catch common mistakes and unwrap calls
-        run: cargo clippy -- -D warnings -D clippy::large_futures
+        run: |
+          cargo --locked clippy
+          cargo --locked clippy --target x86_64-apple-darwin
+          cargo --locked clippy --target x86_64-unknown-freebsd
+          cargo --locked clippy --target x86_64-unknown-netbsd
+          cargo --locked clippy --target x86_64-pc-windows-gnu
 
   linux_test:
     runs-on: ubuntu-latest
-    needs: lint
+    needs: [fmt, clippy]
+    strategy:
+      matrix:
+        # Test in both debug and release mode
+        env:
+          - PROFILE: dev
+          - PROFILE: release
     env:
       RUSTFLAGS: -D warnings
       RUST_BACKTRACE: full
       RUST_LOG: trace
+      PROFILE: ${{ matrix.env.PROFILE }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Setup
         run: |
           sudo mkdir -p /run/user/$UID |
@@ -69,36 +80,35 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build and Test
         run: |
-          mkdir -p /run/user/$UID
-          sed -e s/UID/$UID/ -e s/PATH/path/ CI/dbus-session.conf > /tmp/dbus-session.conf
-          sed -e s/UID/$UID/ -e s/PATH/abstract/ CI/dbus-session.conf > /tmp/dbus-session-abstract.conf
-          dbus-run-session --config-file /tmp/dbus-session-abstract.conf -- cargo test --verbose -- basic_connection
-          dbus-run-session --config-file /tmp/dbus-session.conf -- cargo test --verbose --all-features -- --skip fdpass_systemd
-          # check cookie-sha1 auth against dbus-daemon
-          sed -i s/EXTERNAL/DBUS_COOKIE_SHA1/g /tmp/dbus-session.conf
-          dbus-run-session --config-file /tmp/dbus-session.conf -- cargo test --verbose -- basic_connection
+          dbus-run-session --config-file /tmp/dbus-session-abstract.conf -- cargo --locked test --profile "$PROFILE" --verbose -- basic_connection
+          # All features except tokio.
+          dbus-run-session --config-file /tmp/dbus-session.conf -- \
+            cargo --locked test --profile "$PROFILE" --verbose --features uuid,url,time,chrono,option-as-array,vsock,bus-impl \
+              -- --skip fdpass_systemd
           # Test tokio support.
-          dbus-run-session --config-file /tmp/dbus-session.conf -- cargo test --verbose --tests -p zbus --no-default-features --features tokio -- --skip fdpass_systemd
-          dbus-run-session --config-file /tmp/dbus-session.conf -- cargo test --verbose --doc --no-default-features connection::Connection::executor
+          dbus-run-session --config-file /tmp/dbus-session.conf -- \
+            cargo --locked test --profile "$PROFILE" --verbose --tests -p zbus --no-default-features \
+              --features tokio-vsock -- --skip fdpass_systemd
+          dbus-run-session --config-file /tmp/dbus-session.conf -- \
+            cargo --locked test --profile "$PROFILE" --verbose --doc --no-default-features connection::Connection::executor
+          # zvariant only with ostree tests (which implicitly enables `gvariant` feature too).
+          cargo --locked t -p zvariant --features ostree-tests
 
   windows_test:
     runs-on: windows-latest
-    needs: lint
+    needs: [fmt, clippy]
     env:
       RUSTFLAGS: -D warnings
       RUST_BACKTRACE: full
       RUST_LOG: trace
-      ErrorActionPreference: Stop
-      WarningPreference: Stop
-      PKG_CONFIG_PATH: C:/lib/pkgconfig
-      DBUS_SESSION_BUS_ADDRESS: tcp:host=127.0.0.1,port=9876
-      TRYBUILD: overwrite # ignore ui tests
+      PKG_CONFIG: C:\bin\pkg-config.exe
+      PKG_CONFIG_PATH: C:\lib\pkgconfig
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Cache Dependencies
         id: cache-deps
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             c:/share/*dbus*
@@ -107,6 +117,7 @@ jobs:
             c:/bin/xmlwf.exe
             c:/bin/*dbus*
             c:/lib/*dbus*
+            c:/bin/*pkg-config*
             c:/var/lib/*dbus*
             c:/lib/*glib*
             c:/lib/*gio*
@@ -133,17 +144,18 @@ jobs:
             c:/bin/*intl*
           key: ${{ runner.os }}-cache
 
-      - name: Install pkg-config
-        shell: pwsh
-        run: |
-          # This is needed for some reason: https://github.com/dbus2/zbus/actions/runs/4917893488/jobs/8783555606
-          choco feature enable -n allowEmptyChecksums
-          choco install -y pkgconfiglite
-
-      - name: Install Meson
+      - name: Install Meson and Ninja
         if: steps.cache-deps.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: pip3 install meson
+        run: pip3 install meson ninja
+
+      - name: Install pkg-config
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: |
+          git clone --branch meson-glib-subproject --depth 1 https://gitlab.freedesktop.org/tpm/pkg-config.git
+          cd pkg-config
+          meson build -Dprefix=C:\ --buildtype release
+          ninja -C build
+          ninja -C build install
 
       - name: Setup MSVC Environment
         if: steps.cache-deps.outputs.cache-hit != 'true'
@@ -151,7 +163,6 @@ jobs:
 
       - name: Build & Install GLib
         if: steps.cache-deps.outputs.cache-hit != 'true'
-        shell: pwsh
         run: |
           (New-Object System.Net.WebClient).DownloadString('https://wrapdb.mesonbuild.com/v2/pcre_8.37-2/get_patch') >$null
           (New-Object System.Net.WebClient).DownloadString('https://zlib.net/fossils/') >$null
@@ -163,7 +174,6 @@ jobs:
 
       - name: Build & Install libexpat
         if: steps.cache-deps.outputs.cache-hit != 'true'
-        shell: pwsh
         run: |
           # Upstream expat doesn't ship devel? let's build it then...
           git clone --depth 1 --branch R_2_4_2 https://github.com/libexpat/libexpat \libexpat
@@ -174,7 +184,6 @@ jobs:
 
       - name: Build & Install dbus daemon
         if: steps.cache-deps.outputs.cache-hit != 'true'
-        shell: pwsh
         run: |
           git clone --depth 1 https://gitlab.freedesktop.org/dbus/dbus.git \dbus
           cd -Path \dbus
@@ -186,38 +195,15 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build and Test
-        shell: pwsh
+      - name: Test
         run: |
           $env:PATH += ";C:\bin"
-          Start-Process dbus-daemon.exe --config-file=CI/win32-session.conf
-          cargo test
-
-          $env:DBUS_SESSION_BUS_ADDRESS = $null
-          $env:ZBUS_GDBUS_TEST = "1"
-          # This is an undocumented implementation detail, but easier and faster than calling the gdbus C library
-          Start-Process gdbus.exe _win32_run_session_bus
-          # The gdbus process above will exit when idle for more than three seconds, usually right in the middle
-          # of the doc tests. This process will keep it alive.
-          Start-Process gdbus.exe 'monitor -e -d org.freedesktop.DBus'
-          cargo test --features zbus/windows-gdbus
-
-  cross_check:
-    runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: -D warnings
-    steps:
-      - uses: actions/checkout@v3
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-          targets: x86_64-apple-darwin, x86_64-unknown-freebsd, x86_64-unknown-netbsd
-      - uses: Swatinem/rust-cache@v2
-      - name: Check portability
-        run: |
-          cargo check --target x86_64-apple-darwin
-          cargo check --target x86_64-unknown-freebsd
-          cargo check --target x86_64-unknown-netbsd
+          Start-Process dbus-daemon.exe '--config-file=CI/win32-session.conf --address=autolaunch:'
+          cargo --locked test
+          # tokio feature
+          cargo --locked test --no-default-features --features tokio
+          # zvariant only with ostree tests (which implicitly enables `gvariant` feature too).
+          cargo --locked t -p zvariant --features ostree-tests
 
   zvariant_fuzz:
     runs-on: ubuntu-latest
@@ -225,26 +211,32 @@ jobs:
       RUSTFLAGS: -D warnings
       RUST_BACKTRACE: full
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
       - uses: Swatinem/rust-cache@v2
       - name: Fuzz zvariant
         run: |
-          cargo install cargo-fuzz
-          cargo fuzz run --fuzz-dir zvariant/fuzz dbus -- -max_total_time=30 -max_len=100M
-          cargo fuzz run --fuzz-dir zvariant/fuzz gvariant -- -max_total_time=30 -max_len=100M
+          cargo --locked install cargo-fuzz
+          cargo --locked fuzz run --fuzz-dir zvariant/fuzz dbus -- -max_total_time=30 -max_len=100M
+          cargo --locked fuzz run --fuzz-dir zvariant/fuzz --features gvariant gvariant -- -max_total_time=30 -max_len=100M
 
   doc_build:
     runs-on: ubuntu-latest
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: Check documentation build
-        run: cargo doc
+      - name: Check zvariant documentation build
+        run: cargo --locked doc --all-features -p zvariant
+      - name: Check zbus_names documentation build
+        run: cargo --locked doc --all-features -p zbus_names
+      - name: Check zbus documentation build
+        run: cargo --locked doc --all-features -p zbus
+      - name: Check zbus_xml documentation build
+        run: cargo --locked doc --all-features -p zbus_xml

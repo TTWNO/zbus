@@ -1,6 +1,9 @@
 //! Bus match rule API.
 
-use std::ops::Deref;
+use std::{
+    fmt::{Display, Write},
+    ops::Deref,
+};
 
 use serde::{de, Deserialize, Serialize};
 use static_assertions::assert_impl_all;
@@ -18,10 +21,10 @@ pub use builder::Builder;
 
 /// A bus match rule for subscribing to specific messages.
 ///
-/// This is mainly used by peer to subscribe to specific signals as by default the bus will not
-/// send out most broadcasted signals. This API is intended to make it easy to create and parse
-/// match rules. See the [match rules section of the D-Bus specification][mrs] for a description of
-/// each possible element of a match rule.
+/// This is mainly used to subscribe to specific signals as by default the bus will not send out
+/// most broadcasted signals. This API is intended to make it easy to create and parse match rules.
+/// See the [match rules section of the D-Bus specification][mrs] for a description of each
+/// possible element of a match rule.
 ///
 /// # Examples
 ///
@@ -54,7 +57,7 @@ pub use builder::Builder;
 /// let parsed_rule = MatchRule::try_from(rule_str.as_str())?;
 /// assert_eq!(rule, parsed_rule);
 ///
-/// // Now for `ObjectManager::InterfacesAdded` signal.
+/// // Now for the `ObjectManager::InterfacesAdded` signal.
 /// let rule = MatchRule::builder()
 ///     .msg_type(zbus::message::Type::Signal)
 ///     .sender("org.zbus")?
@@ -117,12 +120,12 @@ impl<'m> MatchRule<'m> {
         self.msg_type
     }
 
-    /// The interfac, if set.
+    /// The interface, if set.
     pub fn interface(&self) -> Option<&InterfaceName<'_>> {
         self.interface.as_ref()
     }
 
-    /// The member name if set.
+    /// The member name, if set.
     pub fn member(&self) -> Option<&MemberName<'_>> {
         self.member.as_ref()
     }
@@ -152,7 +155,7 @@ impl<'m> MatchRule<'m> {
         self.arg0ns.as_ref()
     }
 
-    /// Creates an owned clone of `self`.
+    /// Create an owned clone of `self`.
     pub fn to_owned(&self) -> MatchRule<'static> {
         MatchRule {
             msg_type: self.msg_type,
@@ -171,7 +174,7 @@ impl<'m> MatchRule<'m> {
         }
     }
 
-    /// Creates an owned clone of `self`.
+    /// Convert into an owned clone of `self`.
     pub fn into_owned(self) -> MatchRule<'static> {
         MatchRule {
             msg_type: self.msg_type,
@@ -204,7 +207,7 @@ impl<'m> MatchRule<'m> {
     /// * `sender` in the rule (if set) that is a well-known name. The `sender` on a message is
     ///   always a unique name.
     /// * `destination` in the rule when `destination` on the `msg` is a well-known name. The
-    ///   `destination` on match rule is always a unique name.
+    ///   `destination` on a match rule is always a unique name.
     pub fn matches(&self, msg: &zbus::message::Message) -> Result<bool> {
         let hdr = msg.header();
 
@@ -274,7 +277,7 @@ impl<'m> MatchRule<'m> {
 
         // The arg0 namespace.
         if let Some(arg0_ns) = self.arg0ns() {
-            if let Ok(arg0) = msg.body_unchecked::<BusName<'_>>() {
+            if let Ok(arg0) = msg.body().deserialize_unchecked::<BusName<'_>>() {
                 match arg0.strip_prefix(arg0_ns.as_str()) {
                     None => return Ok(false),
                     Some(s) if !s.is_empty() && !s.starts_with('.') => return Ok(false),
@@ -289,7 +292,8 @@ impl<'m> MatchRule<'m> {
         if self.args().is_empty() && self.arg_paths().is_empty() {
             return Ok(true);
         }
-        let structure = match msg.body::<Structure<'_>>() {
+        let body = msg.body();
+        let structure = match body.deserialize::<Structure<'_>>() {
             Ok(s) => s,
             Err(_) => return Ok(false),
         };
@@ -320,12 +324,26 @@ impl<'m> MatchRule<'m> {
 
         Ok(true)
     }
+
+    pub(crate) fn fdo_signal_builder<S>(signal_name: S) -> Builder<'m>
+    where
+        S: TryInto<MemberName<'m>>,
+        S::Error: Into<Error>,
+    {
+        Builder::new()
+            .msg_type(Type::Signal)
+            .sender("org.freedesktop.DBus")
+            .unwrap()
+            .interface("org.freedesktop.DBus")
+            .unwrap()
+            .member(signal_name)
+            .unwrap()
+    }
 }
 
-impl ToString for MatchRule<'_> {
-    fn to_string(&self) -> String {
-        let mut s = String::new();
-
+impl Display for MatchRule<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut first_component = true;
         if let Some(msg_type) = self.msg_type() {
             let type_str = match msg_type {
                 Type::Error => "error",
@@ -333,50 +351,67 @@ impl ToString for MatchRule<'_> {
                 Type::MethodReturn => "method_return",
                 Type::Signal => "signal",
             };
-            add_match_rule_string_component(&mut s, "type", type_str);
+            write_match_rule_string_component(f, "type", type_str, &mut first_component)?;
         }
         if let Some(sender) = self.sender() {
-            add_match_rule_string_component(&mut s, "sender", sender);
+            write_match_rule_string_component(f, "sender", sender, &mut first_component)?;
         }
         if let Some(interface) = self.interface() {
-            add_match_rule_string_component(&mut s, "interface", interface);
+            write_match_rule_string_component(f, "interface", interface, &mut first_component)?;
         }
         if let Some(member) = self.member() {
-            add_match_rule_string_component(&mut s, "member", member);
+            write_match_rule_string_component(f, "member", member, &mut first_component)?;
         }
         if let Some(destination) = self.destination() {
-            add_match_rule_string_component(&mut s, "destination", destination);
+            write_match_rule_string_component(f, "destination", destination, &mut first_component)?;
         }
         if let Some(path_spec) = self.path_spec() {
             let (key, value) = match path_spec {
                 PathSpec::Path(path) => ("path", path),
                 PathSpec::PathNamespace(ns) => ("path_namespace", ns),
             };
-            add_match_rule_string_component(&mut s, key, value);
+            write_match_rule_string_component(f, key, value, &mut first_component)?;
         }
         for (i, arg) in self.args() {
-            add_match_rule_string_component(&mut s, &format!("arg{i}"), arg);
+            write_comma(f, &mut first_component)?;
+            write!(f, "arg{i}='{arg}'")?;
         }
         for (i, arg_path) in self.arg_paths() {
-            add_match_rule_string_component(&mut s, &format!("arg{i}path"), arg_path);
+            write_comma(f, &mut first_component)?;
+            write!(f, "arg{i}path='{arg_path}'")?;
         }
         if let Some(arg0namespace) = self.arg0ns() {
-            add_match_rule_string_component(&mut s, "arg0namespace", arg0namespace)
+            write_comma(f, &mut first_component)?;
+            write!(f, "arg0namespace='{arg0namespace}'")?;
         }
 
-        s
+        Ok(())
     }
 }
 
-fn add_match_rule_string_component(rule: &mut String, key: &str, value: &str) {
-    if !rule.is_empty() {
-        rule.push(',');
+fn write_match_rule_string_component(
+    f: &mut std::fmt::Formatter<'_>,
+    key: &str,
+    value: &str,
+    first_component: &mut bool,
+) -> std::fmt::Result {
+    write_comma(f, first_component)?;
+    f.write_str(key)?;
+    f.write_str("='")?;
+    f.write_str(value)?;
+    f.write_char('\'')?;
+
+    Ok(())
+}
+
+fn write_comma(f: &mut std::fmt::Formatter<'_>, first_component: &mut bool) -> std::fmt::Result {
+    if *first_component {
+        *first_component = false;
+    } else {
+        f.write_char(',')?;
     }
-    rule.push_str(key);
-    rule.push('=');
-    rule.push('\'');
-    rule.push_str(value);
-    rule.push('\'');
+
+    Ok(())
 }
 
 impl<'m> TryFrom<&'m str> for MatchRule<'m> {
@@ -467,7 +502,7 @@ pub enum PathSpec<'m> {
 assert_impl_all!(PathSpec<'_>: Send, Sync, Unpin);
 
 impl<'m> PathSpec<'m> {
-    /// Creates an owned clone of `self`.
+    /// Create an owned clone of `self`.
     fn to_owned(&self) -> PathSpec<'static> {
         match self {
             PathSpec::Path(path) => PathSpec::Path(path.to_owned()),
@@ -475,7 +510,7 @@ impl<'m> PathSpec<'m> {
         }
     }
 
-    /// Creates an owned clone of `self`.
+    /// Convert into an owned clone of `self`.
     pub fn into_owned(self) -> PathSpec<'static> {
         match self {
             PathSpec::Path(path) => PathSpec::Path(path.into_owned()),
@@ -510,7 +545,7 @@ impl Deref for OwnedMatchRule {
     }
 }
 
-impl From<OwnedMatchRule> for MatchRule<'static> {
+impl From<OwnedMatchRule> for MatchRule<'_> {
     fn from(o: OwnedMatchRule) -> Self {
         o.into_inner()
     }

@@ -1,18 +1,17 @@
-use crate::utils::{pat_ident, typed_arg, zbus_path};
+use crate::utils::{pat_ident, typed_arg, zbus_path, PropertyEmitsChangedSignal};
 use proc_macro2::{Literal, Span, TokenStream};
 use quote::{format_ident, quote, quote_spanned, ToTokens};
-use regex::Regex;
 use syn::{
-    self, fold::Fold, parse_quote, parse_str, spanned::Spanned, AttributeArgs, Error, FnArg, Ident,
-    ItemTrait, Path, ReturnType, TraitItemMethod,
+    fold::Fold, parse_quote, parse_str, punctuated::Punctuated, spanned::Spanned, Error, FnArg,
+    Ident, ItemTrait, Meta, Path, ReturnType, Token, TraitItemFn, Visibility,
 };
 use zvariant_utils::{case, def_attrs};
 
-// FIXME: The list name should once be "zbus" instead of "dbus_proxy" (like in serde).
 def_attrs! {
-    crate dbus_proxy;
+    crate zbus;
 
-    pub ImplAttributes("impl block") {
+    // Keep this in sync with interface's proxy method attributes.
+    pub TraitAttributes("trait") {
         interface str,
         name str,
         assume_defaults bool,
@@ -24,6 +23,7 @@ def_attrs! {
         gen_blocking bool
     };
 
+    // Keep this in sync with interface's proxy method attributes.
     pub MethodAttributes("method") {
         name str,
         property {
@@ -62,20 +62,10 @@ impl AsyncOpts {
     }
 }
 
-pub fn expand(args: AttributeArgs, input: ItemTrait) -> Result<TokenStream, Error> {
-    let ImplAttributes {
-        interface,
-        name,
-        assume_defaults,
-        default_path,
-        default_service,
-        async_name,
-        blocking_name,
-        gen_async,
-        gen_blocking,
-    } = ImplAttributes::parse_nested_metas(&args)?;
+pub fn expand(args: Punctuated<Meta, Token![,]>, input: ItemTrait) -> Result<TokenStream, Error> {
+    let attrs = TraitAttributes::parse_nested_metas(args)?;
 
-    let iface_name = match (interface, name) {
+    let iface_name = match (attrs.interface, attrs.name) {
         (Some(name), None) | (None, Some(name)) => Ok(Some(name)),
         (None, None) => Ok(None),
         (Some(_), Some(_)) => Err(syn::Error::new(
@@ -83,8 +73,11 @@ pub fn expand(args: AttributeArgs, input: ItemTrait) -> Result<TokenStream, Erro
             "both `interface` and `name` attributes shouldn't be specified at the same time",
         )),
     }?;
-    let gen_async = gen_async.unwrap_or(true);
-    let gen_blocking = gen_blocking.unwrap_or(true);
+    let gen_async = attrs.gen_async.unwrap_or(true);
+    #[cfg(feature = "blocking-api")]
+    let gen_blocking = attrs.gen_blocking.unwrap_or(true);
+    #[cfg(not(feature = "blocking-api"))]
+    let gen_blocking = false;
 
     // Some sanity checks
     assert!(
@@ -92,16 +85,16 @@ pub fn expand(args: AttributeArgs, input: ItemTrait) -> Result<TokenStream, Erro
         "Can't disable both asynchronous and blocking proxy. 😸",
     );
     assert!(
-        gen_blocking || blocking_name.is_none(),
+        gen_blocking || attrs.blocking_name.is_none(),
         "Can't set blocking proxy's name if you disabled it. 😸",
     );
     assert!(
-        gen_async || async_name.is_none(),
+        gen_async || attrs.async_name.is_none(),
         "Can't set asynchronous proxy's name if you disabled it. 😸",
     );
 
     let blocking_proxy = if gen_blocking {
-        let proxy_name = blocking_name.unwrap_or_else(|| {
+        let proxy_name = attrs.blocking_name.unwrap_or_else(|| {
             if gen_async {
                 format!("{}ProxyBlocking", input.ident)
             } else {
@@ -112,9 +105,9 @@ pub fn expand(args: AttributeArgs, input: ItemTrait) -> Result<TokenStream, Erro
         create_proxy(
             &input,
             iface_name.as_deref(),
-            assume_defaults,
-            default_path.as_deref(),
-            default_service.as_deref(),
+            attrs.assume_defaults,
+            attrs.default_path.as_deref(),
+            attrs.default_service.as_deref(),
             &proxy_name,
             true,
             // Signal args structs are shared between the two proxies so always generate it for
@@ -125,13 +118,15 @@ pub fn expand(args: AttributeArgs, input: ItemTrait) -> Result<TokenStream, Erro
         quote! {}
     };
     let async_proxy = if gen_async {
-        let proxy_name = async_name.unwrap_or_else(|| format!("{}Proxy", input.ident));
+        let proxy_name = attrs
+            .async_name
+            .unwrap_or_else(|| format!("{}Proxy", input.ident));
         create_proxy(
             &input,
             iface_name.as_deref(),
-            assume_defaults,
-            default_path.as_deref(),
-            default_service.as_deref(),
+            attrs.assume_defaults,
+            attrs.default_path.as_deref(),
+            attrs.default_service.as_deref(),
             &proxy_name,
             false,
             true,
@@ -163,26 +158,42 @@ pub fn create_proxy(
     let other_attrs: Vec<_> = input
         .attrs
         .iter()
-        .filter(|a| !a.path.is_ident("dbus_proxy"))
+        .filter(|a| !a.path().is_ident("zbus"))
         .collect();
     let proxy_name = Ident::new(proxy_name, Span::call_site());
     let ident = input.ident.to_string();
     let iface_name = iface_name
-        .map(ToString::to_string)
+        .map(|iface| {
+            // Ensure the interface name is valid.
+            zbus_names::InterfaceName::try_from(iface)
+                .map_err(|e| Error::new(input.span(), format!("{e}")))
+                .map(|i| i.to_string())
+        })
+        .transpose()?
         .unwrap_or(format!("org.freedesktop.{ident}"));
     let assume_defaults = assume_defaults.unwrap_or(false);
+    let default_path = default_path
+        .map(|path| {
+            // Ensure the path is valid.
+            zvariant::ObjectPath::try_from(path)
+                .map_err(|e| Error::new(input.span(), format!("{e}")))
+                .map(|p| p.to_string())
+        })
+        .transpose()?;
+    let default_service = default_service
+        .map(|srv| {
+            // Ensure the service is valid.
+            zbus_names::BusName::try_from(srv)
+                .map_err(|e| Error::new(input.span(), format!("{e}")))
+                .map(|n| n.to_string())
+        })
+        .transpose()?;
     let (default_path, default_service) = if assume_defaults {
-        let path = default_path
-            .map(ToString::to_string)
-            .or_else(|| Some(format!("/org/freedesktop/{ident}")));
-        let svc = default_service
-            .map(ToString::to_string)
-            .or_else(|| Some(iface_name.clone()));
+        let path = default_path.or_else(|| Some(format!("/org/freedesktop/{ident}")));
+        let svc = default_service.or_else(|| Some(iface_name.clone()));
         (path, svc)
     } else {
-        let path = default_path.map(ToString::to_string);
-        let svc = default_service.map(ToString::to_string);
-        (path, svc)
+        (default_path, default_service)
     };
     let mut methods = TokenStream::new();
     let mut stream_types = TokenStream::new();
@@ -190,18 +201,20 @@ pub fn create_proxy(
     let mut uncached_properties: Vec<String> = vec![];
 
     let async_opts = AsyncOpts::new(blocking);
+    let visibility = &input.vis;
 
     for i in input.items.iter() {
-        if let syn::TraitItem::Method(m) = i {
-            let mut attrs = MethodAttributes::parse(&m.attrs)?;
+        if let syn::TraitItem::Fn(m) = i {
+            let method_attrs = MethodAttributes::parse(&m.attrs)?;
+            let property = method_attrs.property.as_ref();
 
             let method_name = m.sig.ident.to_string();
 
-            let is_property = attrs.property.is_some();
-            let is_signal = attrs.signal;
+            let is_signal = method_attrs.signal;
+            let is_property = property.is_some();
             let has_inputs = m.sig.inputs.len() > 1;
 
-            let member_name = attrs.name.take().unwrap_or_else(|| {
+            let member_name = method_attrs.name.clone().unwrap_or_else(|| {
                 case::pascal_or_camel_case(
                     if is_property && has_inputs {
                         assert!(method_name.starts_with("set_"));
@@ -213,7 +226,7 @@ pub fn create_proxy(
                 )
             });
 
-            let m = if let Some(prop_attrs) = &attrs.property {
+            let m = if let Some(prop_attrs) = property {
                 has_properties = true;
 
                 let emits_changed_signal = if let Some(s) = &prop_attrs.emits_changed_signal {
@@ -241,13 +254,14 @@ pub fn create_proxy(
                     &method_name,
                     m,
                     &async_opts,
+                    visibility,
                     gen_sig_args,
                 );
                 stream_types.extend(types);
 
                 method
             } else {
-                gen_proxy_method_call(&member_name, &method_name, m, &attrs, &async_opts)?
+                gen_proxy_method_call(&member_name, &method_name, m, method_attrs, &async_opts)?
             };
             methods.extend(m);
         }
@@ -330,24 +344,39 @@ pub fn create_proxy(
         }
     };
     let default_path = match default_path {
-        Some(p) => quote! { Some(#p) },
-        None => quote! { None },
+        Some(p) => quote! { &Some(#zbus::zvariant::ObjectPath::from_static_str_unchecked(#p)) },
+        None => quote! { &None },
     };
     let default_service = match default_service {
-        Some(d) => quote! { Some(#d) },
-        None => quote! { None },
+        Some(d) => {
+            if d.starts_with(':') || d == "org.freedesktop.DBus" {
+                quote! {
+                    &Some(#zbus::names::BusName::Unique(
+                        #zbus::names::UniqueName::from_static_str_unchecked(#d),
+                    ))
+                }
+            } else {
+                quote! {
+                    &Some(#zbus::names::BusName::WellKnown(
+                        #zbus::names::WellKnownName::from_static_str_unchecked(#d),
+                    ))
+                }
+            }
+        }
+        None => quote! { &None },
     };
 
     Ok(quote! {
-        impl<'a> #zbus::proxy::ProxyDefault for #proxy_name<'a> {
-            const INTERFACE: Option<&'static str> = Some(#iface_name);
-            const DESTINATION: Option<&'static str> = #default_service;
-            const PATH: Option<&'static str> = #default_path;
+        impl<'a> #zbus::proxy::Defaults for #proxy_name<'a> {
+            const INTERFACE: &'static Option<#zbus::names::InterfaceName<'static>> =
+                &Some(#zbus::names::InterfaceName::from_static_str_unchecked(#iface_name));
+            const DESTINATION: &'static Option<#zbus::names::BusName<'static>> = #default_service;
+            const PATH: &'static Option<#zbus::zvariant::ObjectPath<'static>> = #default_path;
         }
 
         #(#other_attrs)*
         #[derive(Clone, Debug)]
-        pub struct #proxy_name<'p>(#proxy_struct<'p>);
+        #visibility struct #proxy_name<'p>(#proxy_struct<'p>);
 
         impl<'p> #proxy_name<'p> {
             #proxy_method_new
@@ -374,6 +403,11 @@ pub fn create_proxy(
                 &self.0
             }
 
+            /// The mutable reference to the underlying `zbus::Proxy`.
+            pub fn inner_mut(&mut self) -> &mut #proxy_struct<'p> {
+                &mut self.0
+            }
+
             #methods
         }
 
@@ -397,36 +431,21 @@ pub fn create_proxy(
             }
         }
 
-        impl<'p> ::std::ops::Deref for #proxy_name<'p> {
-            type Target = #proxy_struct<'p>;
-
-            fn deref(&self) -> &Self::Target {
-                &self.0
-            }
-        }
-
-        impl<'p> ::std::ops::DerefMut for #proxy_name<'p> {
-            fn deref_mut(&mut self) -> &mut Self::Target {
-                &mut self.0
-            }
-        }
-
         impl<'p> ::std::convert::AsRef<#proxy_struct<'p>> for #proxy_name<'p> {
             fn as_ref(&self) -> &#proxy_struct<'p> {
-                &*self
+                self.inner()
             }
         }
 
         impl<'p> ::std::convert::AsMut<#proxy_struct<'p>> for #proxy_name<'p> {
             fn as_mut(&mut self) -> &mut #proxy_struct<'p> {
-                &mut *self
+                self.inner_mut()
             }
         }
 
         impl<'p> #zbus::zvariant::Type for #proxy_name<'p> {
-            fn signature() -> #zbus::zvariant::Signature<'static> {
-                #zbus::zvariant::OwnedObjectPath::signature()
-            }
+            const SIGNATURE: &'static #zbus::zvariant::Signature =
+                &#zbus::zvariant::Signature::ObjectPath;
         }
 
         impl<'p> #zbus::export::serde::ser::Serialize for #proxy_name<'p> {
@@ -448,8 +467,8 @@ pub fn create_proxy(
 fn gen_proxy_method_call(
     method_name: &str,
     snake_case_name: &str,
-    m: &TraitItemMethod,
-    attrs: &MethodAttributes,
+    m: &TraitItemFn,
+    method_attrs: MethodAttributes,
     async_opts: &AsyncOpts,
 ) -> Result<TokenStream, Error> {
     let AsyncOpts {
@@ -461,7 +480,7 @@ fn gen_proxy_method_call(
     let other_attrs: Vec<_> = m
         .attrs
         .iter()
-        .filter(|a| !a.path.is_ident("dbus_proxy"))
+        .filter(|a| !a.path().is_ident("zbus"))
         .collect();
     let args: Vec<_> = m
         .sig
@@ -471,28 +490,29 @@ fn gen_proxy_method_call(
         .filter_map(pat_ident)
         .collect();
 
-    let proxy_object = attrs.object.as_ref().map(|o| {
+    let proxy_object = method_attrs.object.as_ref().map(|o| {
         if *blocking {
             // FIXME: for some reason Rust doesn't let us move `blocking_proxy_object` so we've to
             // clone.
-            attrs
+            method_attrs
                 .blocking_object
                 .as_ref()
                 .cloned()
                 .unwrap_or_else(|| format!("{o}ProxyBlocking"))
         } else {
-            attrs
+            method_attrs
                 .async_object
                 .as_ref()
                 .cloned()
                 .unwrap_or_else(|| format!("{o}Proxy"))
         }
     });
-    let no_reply = attrs.no_reply;
-    let no_autostart = attrs.no_autostart;
-    let allow_interactive_auth = attrs.allow_interactive_auth;
 
-    let method_flags = match (no_reply, no_autostart, allow_interactive_auth) {
+    let method_flags = match (
+        method_attrs.no_reply,
+        method_attrs.no_autostart,
+        method_attrs.allow_interactive_auth,
+    ) {
         (true, false, false) => Some(quote!(::std::convert::Into::into(
             zbus::proxy::MethodFlags::NoReplyExpected
         ))),
@@ -534,12 +554,18 @@ fn gen_proxy_method_call(
         let is_input_type = inputs.iter().any(|arg| {
             // FIXME: We want to only require `Serialize` from input types and `DeserializeOwned`
             // from output types but since we don't have type introspection, we employ this
-            // workaround of regex matching on string reprepresention of the the types to figure out
+            // workaround of matching on the string representation of the the types to figure out
             // which generic types are input types.
             if let FnArg::Typed(pat) = arg {
-                let pattern = format!("& *{}", param.to_token_stream());
-                let regex = Regex::new(&pattern).unwrap();
-                regex.is_match(&pat.ty.to_token_stream().to_string())
+                let pat = pat.ty.to_token_stream().to_string();
+
+                if let Some(ty_name) = pat.strip_prefix('&') {
+                    let ty_name = ty_name.trim_start();
+
+                    ty_name == param.to_token_stream().to_string()
+                } else {
+                    false
+                }
             } else {
                 false
             }
@@ -568,7 +594,7 @@ fn gen_proxy_method_call(
                 let object_path: #zbus::zvariant::OwnedObjectPath =
                     self.0.call(
                         #method_name,
-                        &(#(#args),*),
+                        &#zbus::zvariant::DynamicTuple((#(#args,)*)),
                     )
                     #wait?;
                 #proxy_path::builder(&self.0.connection())
@@ -583,11 +609,11 @@ fn gen_proxy_method_call(
             // the '()' from the signature that we add and not the actual intended ones.
             let arg = &args[0];
             quote! {
-                &(#arg,)
+                &#zbus::zvariant::DynamicTuple((#arg,))
             }
         } else {
             quote! {
-                &(#(#args),*)
+                &#zbus::zvariant::DynamicTuple((#(#args),*))
             }
         };
 
@@ -598,7 +624,7 @@ fn gen_proxy_method_call(
         };
 
         if let Some(method_flags) = method_flags {
-            if no_reply {
+            if method_attrs.no_reply {
                 Ok(quote! {
                     #(#other_attrs)*
                     pub #usage #signature {
@@ -634,39 +660,10 @@ fn gen_proxy_method_call(
     }
 }
 
-/// Standard annotation `org.freedesktop.DBus.Property.EmitsChangedSignal`.
-///
-/// See <https://dbus.freedesktop.org/doc/dbus-specification.html#introspection-format>.
-#[derive(Debug, Default)]
-enum PropertyEmitsChangedSignal {
-    #[default]
-    True,
-    Invalidates,
-    Const,
-    False,
-}
-
-impl PropertyEmitsChangedSignal {
-    fn parse(s: &str, span: Span) -> syn::Result<Self> {
-        use PropertyEmitsChangedSignal::*;
-
-        match s {
-            "true" => Ok(True),
-            "invalidates" => Ok(Invalidates),
-            "const" => Ok(Const),
-            "false" => Ok(False),
-            other => Err(syn::Error::new(
-                span,
-                format!("invalid value \"{other}\" for attribute `property(emits_changed_signal)`"),
-            )),
-        }
-    }
-}
-
 fn gen_proxy_property(
     property_name: &str,
     method_name: &str,
-    m: &TraitItemMethod,
+    m: &TraitItemFn,
     async_opts: &AsyncOpts,
     emits_changed_signal: PropertyEmitsChangedSignal,
 ) -> TokenStream {
@@ -679,7 +676,7 @@ fn gen_proxy_property(
     let other_attrs: Vec<_> = m
         .attrs
         .iter()
-        .filter(|a| !a.path.is_ident("dbus_proxy"))
+        .filter(|a| !a.path().is_ident("zbus"))
         .collect();
     let signature = &m.sig;
     if signature.inputs.len() > 1 {
@@ -790,13 +787,15 @@ impl Fold for SetLifetimeS {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn gen_proxy_signal(
     proxy_name: &Ident,
     iface_name: &str,
     signal_name: &str,
     snake_case_name: &str,
-    method: &TraitItemMethod,
+    method: &TraitItemFn,
     async_opts: &AsyncOpts,
+    visibility: &Visibility,
     gen_sig_args: bool,
 ) -> (TokenStream, TokenStream) {
     let AsyncOpts {
@@ -808,7 +807,7 @@ fn gen_proxy_signal(
     let other_attrs: Vec<_> = method
         .attrs
         .iter()
-        .filter(|a| !a.path.is_ident("dbus_proxy"))
+        .filter(|a| !a.path().is_ident("zbus"))
         .collect();
     let input_types: Vec<_> = method
         .sig
@@ -865,8 +864,8 @@ fn gen_proxy_signal(
     ) = if *blocking {
         (
             "zbus::blocking::Proxy",
-            "https://docs.rs/zbus/latest/zbus/blocking/struct.Proxy.html#method.receive_signal",
-            "https://docs.rs/zbus/latest/zbus/blocking/struct.Proxy.html#method.receive_signal_with_args",
+            "https://docs.rs/zbus/latest/zbus/blocking/proxy/struct.Proxy.html#method.receive_signal",
+            "https://docs.rs/zbus/latest/zbus/blocking/proxy/struct.Proxy.html#method.receive_signal_with_args",
             "Iterator",
             "https://doc.rust-lang.org/std/iter/trait.Iterator.html",
             quote! { blocking::proxy::SignalIterator },
@@ -874,8 +873,8 @@ fn gen_proxy_signal(
     } else {
         (
             "zbus::Proxy",
-            "https://docs.rs/zbus/latest/zbus/struct.Proxy.html#method.receive_signal",
-            "https://docs.rs/zbus/latest/zbus/struct.Proxy.html#method.receive_signal_with_args",
+            "https://docs.rs/zbus/latest/zbus/proxy/struct.Proxy.html#method.receive_signal",
+            "https://docs.rs/zbus/latest/zbus/proxy/struct.Proxy.html#method.receive_signal_with_args",
             "Stream",
             "https://docs.rs/futures/0.3.15/futures/stream/trait.Stream.html",
             quote! { proxy::SignalStream },
@@ -903,18 +902,18 @@ fn gen_proxy_signal(
         quote! {
             #[doc = #receive_with_args_gen_doc]
             #(#other_attrs)*
-            pub #usage fn #receiver_with_args_name(&self, args: &[(u8, &str)]) -> #zbus::Result<#stream_name<'static>>
+            pub #usage fn #receiver_with_args_name(&self, args: &[(u8, &str)]) -> #zbus::Result<#stream_name>
             {
-                self.receive_signal_with_args(#signal_name, args)#wait.map(#stream_name)
+                self.0.receive_signal_with_args(#signal_name, args)#wait.map(#stream_name)
             }
         }
     };
     let receive_signal = quote! {
         #[doc = #receive_gen_doc]
         #(#other_attrs)*
-        pub #usage fn #receiver_name(&self) -> #zbus::Result<#stream_name<'static>>
+        pub #usage fn #receiver_name(&self) -> #zbus::Result<#stream_name>
         {
-            self.receive_signal(#signal_name)#wait.map(#stream_name)
+            self.0.receive_signal(#signal_name)#wait.map(#stream_name)
         }
 
         #receive_signal_with_args
@@ -933,26 +932,12 @@ fn gen_proxy_signal(
         quote! {
             #[doc = #args_struct_gen_doc]
             #[derive(Debug, Clone)]
-            pub struct #signal_name_ident(#zbus::message::Message);
-
-            impl ::std::ops::Deref for #signal_name_ident {
-                type Target = #zbus::message::Message;
-
-                fn deref(&self) -> &#zbus::message::Message {
-                    &self.0
-                }
-            }
-
-            impl ::std::convert::AsRef<#zbus::message::Message> for #signal_name_ident {
-                fn as_ref(&self) -> &#zbus::message::Message {
-                    &self.0
-                }
-            }
+            #visibility struct #signal_name_ident(#zbus::message::Body);
 
             impl #signal_name_ident {
                 #[doc = "Try to construct a "]
                 #[doc = #signal_name]
-                #[doc = " from a [::zbus::message::Message]."]
+                #[doc = " from a [`zbus::Message`]."]
                 pub fn from_message<M>(msg: M) -> ::std::option::Option<Self>
                 where
                     M: ::std::convert::Into<#zbus::message::Message>,
@@ -966,9 +951,22 @@ fn gen_proxy_signal(
                     let member = member.as_ref().map(|m| m.as_str());
 
                     match (message_type, interface, member) {
-                        (#zbus::message::Type::Signal, Some(#iface_name), Some(#signal_name)) => Some(Self(msg)),
+                        (#zbus::message::Type::Signal, Some(#iface_name), Some(#signal_name)) => {
+                            Some(Self(msg.body()))
+                        }
                         _ => None,
                     }
+                }
+
+                #[doc = "The reference to the underlying [`zbus::Message`]."]
+                pub fn message(&self) -> &#zbus::message::Message {
+                    self.0.message()
+                }
+            }
+
+            impl ::std::convert::From<#signal_name_ident> for #zbus::message::Message {
+                fn from(signal: #signal_name_ident) -> Self {
+                    signal.0.message().clone()
                 }
             }
         }
@@ -990,12 +988,12 @@ fn gen_proxy_signal(
                 pub fn args #ty_generics(&'s self) -> #zbus::Result<#signal_args #ty_generics>
                 #where_clause
                 {
-                    ::std::convert::TryFrom::try_from(&**self)
+                    ::std::convert::TryFrom::try_from(&self.0)
                 }
             }
 
             #[doc = #signal_args_gen_doc]
-            pub struct #signal_args #ty_generics {
+            #visibility struct #signal_args #ty_generics {
                 phantom: std::marker::PhantomData<&'s ()>,
                 #(
                     pub #args: #input_types_s
@@ -1024,13 +1022,13 @@ fn gen_proxy_signal(
                 }
             }
 
-            impl #impl_generics ::std::convert::TryFrom<&'s #zbus::message::Message> for #signal_args #ty_generics
+            impl #impl_generics ::std::convert::TryFrom<&'s #zbus::message::Body> for #signal_args #ty_generics
                 #where_clause
             {
                 type Error = #zbus::Error;
 
-                fn try_from(message: &'s #zbus::message::Message) -> #zbus::Result<Self> {
-                    message.body::<(#(#input_types),*)>()
+                fn try_from(msg_body: &'s #zbus::message::Body) -> #zbus::Result<Self> {
+                    msg_body.deserialize::<(#(#input_types),*)>()
                         .map_err(::std::convert::Into::into)
                         .map(|args| {
                             #signal_args {
@@ -1044,18 +1042,18 @@ fn gen_proxy_signal(
     };
     let stream_impl = if *blocking {
         quote! {
-            impl ::std::iter::Iterator for #stream_name<'_> {
+            impl ::std::iter::Iterator for #stream_name {
                 type Item = #signal_name_ident;
 
                 fn next(&mut self) -> ::std::option::Option<Self::Item> {
                     ::std::iter::Iterator::next(&mut self.0)
-                        .map(#signal_name_ident)
+                        .map(|msg| #signal_name_ident(msg.body()))
                 }
             }
         }
     } else {
         quote! {
-            impl #zbus::export::futures_core::stream::Stream for #stream_name<'_> {
+            impl #zbus::export::futures_core::stream::Stream for #stream_name {
                 type Item = #signal_name_ident;
 
                 fn poll_next(
@@ -1066,11 +1064,11 @@ fn gen_proxy_signal(
                         ::std::pin::Pin::new(&mut self.get_mut().0),
                         cx,
                     )
-                    .map(|msg| msg.map(#signal_name_ident))
+                    .map(|msg| msg.map(|msg| #signal_name_ident(msg.body())))
                 }
             }
 
-            impl #zbus::export::ordered_stream::OrderedStream for #stream_name<'_> {
+            impl #zbus::export::ordered_stream::OrderedStream for #stream_name {
                 type Data = #signal_name_ident;
                 type Ordering = #zbus::message::Sequence;
 
@@ -1084,18 +1082,18 @@ fn gen_proxy_signal(
                         cx,
                         before,
                     )
-                    .map(|msg| msg.map_data(#signal_name_ident))
+                    .map(|msg| msg.map_data(|msg| #signal_name_ident(msg.body())))
                 }
             }
 
-            impl #zbus::export::futures_core::stream::FusedStream for #stream_name<'_> {
+            impl #zbus::export::futures_core::stream::FusedStream for #stream_name {
                 fn is_terminated(&self) -> bool {
                     self.0.is_terminated()
                 }
             }
 
             #[#zbus::export::async_trait::async_trait]
-            impl #zbus::AsyncDrop for #stream_name<'_> {
+            impl #zbus::AsyncDrop for #stream_name {
                 async fn async_drop(self) {
                     self.0.async_drop().await
                 }
@@ -1105,35 +1103,21 @@ fn gen_proxy_signal(
     let stream_types = quote! {
         #[doc = #stream_gen_doc]
         #[derive(Debug)]
-        pub struct #stream_name<'a>(#zbus::#signal_type<'a>);
+        #visibility struct #stream_name(#zbus::#signal_type<'static>);
 
         #zbus::export::static_assertions::assert_impl_all!(
-            #stream_name<'_>: ::std::marker::Send, ::std::marker::Unpin
+            #stream_name: ::std::marker::Send, ::std::marker::Unpin
         );
 
-        impl<'a> #stream_name<'a> {
+        impl #stream_name {
             /// Consumes `self`, returning the underlying `zbus::#signal_type`.
-            pub fn into_inner(self) -> #zbus::#signal_type<'a> {
+            pub fn into_inner(self) -> #zbus::#signal_type<'static> {
                 self.0
             }
 
             /// The reference to the underlying `zbus::#signal_type`.
-            pub fn inner(&self) -> & #zbus::#signal_type<'a> {
+            pub fn inner(&self) -> & #zbus::#signal_type<'static> {
                 &self.0
-            }
-        }
-
-        impl<'a> std::ops::Deref for #stream_name<'a> {
-            type Target = #zbus::#signal_type<'a>;
-
-            fn deref(&self) -> &Self::Target {
-                &self.0
-            }
-        }
-
-        impl ::std::ops::DerefMut for #stream_name<'_> {
-            fn deref_mut(&mut self) -> &mut Self::Target {
-                &mut self.0
             }
         }
 

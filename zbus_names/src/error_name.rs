@@ -1,4 +1,7 @@
-use crate::{utils::impl_try_from, Error, Result};
+use crate::{
+    utils::{impl_str_basic, impl_try_from},
+    Error, Result,
+};
 use serde::{de, Deserialize, Serialize};
 use static_assertions::assert_impl_all;
 use std::{
@@ -44,8 +47,10 @@ pub struct ErrorName<'name>(Str<'name>);
 
 assert_impl_all!(ErrorName<'_>: Send, Sync, Unpin);
 
+impl_str_basic!(ErrorName<'_>);
+
 impl<'name> ErrorName<'name> {
-    /// A borrowed clone (never allocates, unlike clone).
+    /// This is faster than `Clone::clone` when `self` contains owned data.
     pub fn as_ref(&self) -> ErrorName<'_> {
         ErrorName(self.0.as_ref())
     }
@@ -65,7 +70,7 @@ impl<'name> ErrorName<'name> {
 
     /// Same as `try_from`, except it takes a `&'static str`.
     pub fn from_static_str(name: &'static str) -> Result<Self> {
-        ensure_correct_error_name(name)?;
+        validate(name)?;
         Ok(Self(Str::from_static(name)))
     }
 
@@ -145,67 +150,18 @@ impl<'de: 'name, 'name> Deserialize<'de> for ErrorName<'name> {
 impl_try_from! {
     ty: ErrorName<'s>,
     owned_ty: OwnedErrorName,
-    validate_fn: ensure_correct_error_name,
+    validate_fn: validate,
     try_from: [&'s str, String, Arc<str>, Cow<'s, str>, Str<'s>],
 }
 
-fn ensure_correct_error_name(name: &str) -> Result<()> {
-    // Rules
-    //
-    // * Only ASCII alphanumeric or `_`.
-    // * Must not begin with a `.`.
-    // * Must contain at least one `.`.
-    // * Each element must:
-    //   * not begin with a digit.
-    //   * be 1 character (so name must be minimum 3 characters long).
-    // * <= 255 characters.
-    if name.len() < 3 {
-        return Err(Error::InvalidErrorName(format!(
-            "`{}` is {} characters long, which is smaller than minimum allowed (3)",
-            name,
-            name.len(),
-        )));
-    } else if name.len() > 255 {
-        return Err(Error::InvalidErrorName(format!(
-            "`{}` is {} characters long, which is longer than maximum allowed (255)",
-            name,
-            name.len(),
-        )));
-    }
-
-    let mut prev = None;
-    let mut no_dot = true;
-    for c in name.chars() {
-        if c == '.' {
-            if prev.is_none() || prev == Some('.') {
-                return Err(Error::InvalidErrorName(String::from(
-                    "must not contain a double `.`",
-                )));
-            }
-
-            if no_dot {
-                no_dot = false;
-            }
-        } else if c.is_ascii_digit() && (prev.is_none() || prev == Some('.')) {
-            return Err(Error::InvalidErrorName(String::from(
-                "each element must not start with a digit",
-            )));
-        } else if !c.is_ascii_alphanumeric() && c != '_' {
-            return Err(Error::InvalidErrorName(format!(
-                "`{c}` character not allowed"
-            )));
-        }
-
-        prev = Some(c);
-    }
-
-    if no_dot {
-        return Err(Error::InvalidErrorName(String::from(
-            "must contain at least 1 `.`",
-        )));
-    }
-
-    Ok(())
+fn validate(name: &str) -> Result<()> {
+    // Error names follow the same rules as interface names.
+    crate::interface_name::validate_bytes(name.as_bytes()).map_err(|_| {
+        Error::InvalidName(
+            "Invalid error name. See \
+            https://dbus.freedesktop.org/doc/dbus-specification.html#message-protocol-names-error",
+        )
+    })
 }
 
 /// This never succeeds but is provided so it's easier to pass `Option::None` values for API
@@ -244,6 +200,8 @@ pub struct OwnedErrorName(#[serde(borrow)] ErrorName<'static>);
 
 assert_impl_all!(OwnedErrorName: Send, Sync, Unpin);
 
+impl_str_basic!(OwnedErrorName);
+
 impl OwnedErrorName {
     /// Convert to the inner `ErrorName`, consuming `self`.
     pub fn into_inner(self) -> ErrorName<'static> {
@@ -270,7 +228,7 @@ impl Borrow<str> for OwnedErrorName {
     }
 }
 
-impl From<OwnedErrorName> for ErrorName<'static> {
+impl From<OwnedErrorName> for ErrorName<'_> {
     fn from(o: OwnedErrorName) -> Self {
         o.into_inner()
     }
@@ -288,7 +246,7 @@ impl From<ErrorName<'_>> for OwnedErrorName {
     }
 }
 
-impl From<OwnedErrorName> for Str<'static> {
+impl From<OwnedErrorName> for Str<'_> {
     fn from(value: OwnedErrorName) -> Self {
         value.into_inner().0
     }

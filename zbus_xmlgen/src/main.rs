@@ -1,202 +1,150 @@
 #![deny(rust_2018_idioms)]
 
 use std::{
-    env::args,
     error::Error,
-    fs::File,
+    fs::{File, OpenOptions},
     io::Write,
-    path::Path,
-    process::{Command, Stdio},
-    result::Result,
 };
 
+use clap::Parser;
+use snakecase::ascii::to_snakecase;
 use zbus::{
     blocking::{connection, fdo::IntrospectableProxy, Connection},
     names::BusName,
+    zvariant::ObjectPath,
 };
 use zbus_xml::{Interface, Node};
 
-use zbus_xmlgen::GenTrait;
-use zvariant::ObjectPath;
+use zbus_xmlgen::write_interfaces;
 
-fn usage() {
-    eprintln!(
-        r#"Usage:
-  zbus-xmlgen <interface.xml>
-  zbus-xmlgen --system|--session <service> <object_path>
-  zbus-xmlgen --address <address> <service> <object_path>
-"#
-    );
+mod cli;
+
+enum OutputTarget {
+    SingleFile(File),
+    Stdout,
+    MultipleFiles,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let input_src;
+    let args = cli::Args::parse();
 
-    let proxy = |conn: Connection, service, path| -> IntrospectableProxy<'_> {
-        IntrospectableProxy::builder(&conn)
-            .destination(service)
+    let DBusInfo(node, service, path, input_src) = match args.command {
+        cli::Command::System {
+            service,
+            object_path,
+        } => DBusInfo::new(Connection::system()?, service, object_path)?,
+        cli::Command::Session {
+            service,
+            object_path,
+        } => DBusInfo::new(Connection::session()?, service, object_path)?,
+        cli::Command::Address {
+            address,
+            service,
+            object_path,
+        } => DBusInfo::new(
+            connection::Builder::address(&*address)?.build()?,
+            service,
+            object_path,
+        )?,
+        cli::Command::File { path } => {
+            let input_src = path.file_name().unwrap().to_string_lossy().to_string();
+            let f = File::open(path)?;
+            DBusInfo(Node::from_reader(f)?, None, None, input_src)
+        }
+    };
+
+    let fdo_iface_prefix = "org.freedesktop.DBus";
+    let (fdo_standard_ifaces, needed_ifaces): (Vec<Interface<'_>>, Vec<Interface<'_>>) = node
+        .interfaces()
+        .iter()
+        .cloned()
+        .partition(|i| i.name().starts_with(fdo_iface_prefix));
+
+    if !fdo_standard_ifaces.is_empty() {
+        eprintln!("Skipping `org.freedesktop.DBus` interfaces, please use https://docs.rs/zbus/latest/zbus/fdo/index.html")
+    }
+
+    let mut output_target = match args.output.as_deref() {
+        Some("-") => OutputTarget::Stdout,
+        Some(path) => {
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(path)?;
+            OutputTarget::SingleFile(file)
+        }
+        _ => OutputTarget::MultipleFiles,
+    };
+
+    for interface in needed_ifaces {
+        let output = write_interfaces(
+            &[interface.clone()],
+            &fdo_standard_ifaces,
+            service.clone(),
+            path.clone(),
+            &input_src,
+            env!("CARGO_BIN_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        )?;
+
+        let interface_name = interface.name();
+        match output_target {
+            OutputTarget::Stdout => println!("{}", output),
+            OutputTarget::SingleFile(ref mut file) => {
+                file.write_all(output.as_bytes())?;
+                println!("Generated code for `{}`", interface_name);
+            }
+            OutputTarget::MultipleFiles => {
+                let filename = interface_name
+                    .split('.')
+                    .last()
+                    .expect("Failed to split name");
+                let filename = to_snakecase(filename);
+                std::fs::write(format!("{}.rs", &filename), output)?;
+                println!("Generated code for `{}` in {}.rs", interface_name, filename);
+            }
+        };
+    }
+
+    Ok(())
+}
+
+struct DBusInfo<'a>(
+    Node<'a>,
+    Option<BusName<'a>>,
+    Option<ObjectPath<'a>>,
+    String,
+);
+
+impl<'a> DBusInfo<'a> {
+    fn new(
+        connection: Connection,
+        service: String,
+        object_path: String,
+    ) -> Result<Self, Box<dyn Error>> {
+        let service: BusName<'_> = service.try_into()?;
+        let path: ObjectPath<'_> = object_path.try_into()?;
+
+        let input_src = format!(
+            "Interface '{}' from service '{}' on system bus",
+            path, service,
+        );
+
+        let xml = IntrospectableProxy::builder(&connection)
+            .destination(service.clone())
             .expect("invalid destination")
-            .path(path)
+            .path(path.clone())
             .expect("invalid path")
             .build()
             .unwrap()
-    };
+            .introspect()?;
 
-    let (node, service, path) = match args().nth(1) {
-        Some(bus) if bus == "--system" || bus == "--session" => {
-            let connection = if bus == "--system" {
-                Connection::system()?
-            } else {
-                Connection::session()?
-            };
-            let service: BusName<'_> = args()
-                .nth(2)
-                .expect("Missing param for service")
-                .try_into()?;
-            let path: ObjectPath<'_> = args()
-                .nth(3)
-                .expect("Missing param for object path")
-                .try_into()?;
-
-            input_src = format!(
-                "Interface '{}' from service '{}' on {} bus",
-                path,
-                service,
-                bus.trim_start_matches("--")
-            );
-
-            let xml = proxy(connection, service.clone(), path.clone()).introspect()?;
-            (
-                Node::from_reader(xml.as_bytes())?,
-                Some(service),
-                Some(path),
-            )
-        }
-        Some(address) if address == "--address" => {
-            let address = args().nth(2).expect("Missing param for address path");
-            let service: BusName<'_> = args()
-                .nth(3)
-                .expect("Missing param for service")
-                .try_into()?;
-            let path: ObjectPath<'_> = args()
-                .nth(4)
-                .expect("Missing param for object path")
-                .try_into()?;
-
-            let connection = connection::Builder::address(&*address)?.build()?;
-
-            input_src = format!("Interface '{path}' from service '{service}'");
-
-            let xml = proxy(connection, service.clone(), path.clone()).introspect()?;
-            (
-                Node::from_reader(xml.as_bytes())?,
-                Some(service),
-                Some(path),
-            )
-        }
-        Some(help) if help == "--help" || help == "-h" => {
-            usage();
-            return Ok(());
-        }
-        Some(path) => {
-            input_src = Path::new(&path)
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .to_string();
-            let f = File::open(path)?;
-            (Node::from_reader(f)?, None, None)
-        }
-        None => {
-            usage();
-            return Ok(());
-        }
-    };
-
-    let mut process = match Command::new("rustfmt").stdin(Stdio::piped()).spawn() {
-        Err(why) => panic!("couldn't spawn rustfmt: {}", why),
-        Ok(process) => process,
-    };
-    let rustfmt_stdin = process.stdin.as_mut().unwrap();
-    let fdo_iface_prefix = "org.freedesktop.DBus";
-    let (fdo_standard_ifaces, needed_ifaces): (Vec<&Interface<'_>>, Vec<&Interface<'_>>) = node
-        .interfaces()
-        .iter()
-        .partition(|&i| i.name().starts_with(fdo_iface_prefix));
-
-    if let Some((first_iface, following_ifaces)) = needed_ifaces.split_first() {
-        if following_ifaces.is_empty() {
-            writeln!(
-                rustfmt_stdin,
-                "//! # DBus interface proxy for: `{}`",
-                first_iface.name()
-            )?;
-        } else {
-            write!(
-                rustfmt_stdin,
-                "//! # DBus interface proxies for: `{}`",
-                first_iface.name()
-            )?;
-            for iface in following_ifaces {
-                write!(rustfmt_stdin, ", `{}`", iface.name())?;
-            }
-            writeln!(rustfmt_stdin)?;
-        }
+        Ok(DBusInfo(
+            Node::from_reader(xml.as_bytes())?,
+            Some(service),
+            Some(path),
+            input_src,
+        ))
     }
-
-    write!(
-        rustfmt_stdin,
-        "//!
-         //! This code was generated by `{}` `{}` from DBus introspection data.
-         //! Source: `{}`.
-         //!
-         //! You may prefer to adapt it, instead of using it verbatim.
-         //!
-         //! More information can be found in the
-         //! [Writing a client proxy](https://dbus2.github.io/zbus/client.html)
-         //! section of the zbus documentation.
-         //!
-        ",
-        env!("CARGO_BIN_NAME"),
-        env!("CARGO_PKG_VERSION"),
-        input_src,
-    )?;
-    if !fdo_standard_ifaces.is_empty() {
-        write!(rustfmt_stdin,
-            "//! This DBus object implements
-             //! [standard DBus interfaces](https://dbus.freedesktop.org/doc/dbus-specification.html),
-             //! (`org.freedesktop.DBus.*`) for which the following zbus proxies can be used:
-             //!
-            ")?;
-        for iface in &fdo_standard_ifaces {
-            let idx = iface.name().rfind('.').unwrap() + 1;
-            let name = &iface.name()[idx..];
-            writeln!(rustfmt_stdin, "//! * [`zbus::fdo::{name}Proxy`]")?;
-        }
-        write!(
-            rustfmt_stdin,
-            "//!
-             //! …consequently `{}` did not generate code for the above interfaces.
-            ",
-            env!("CARGO_BIN_NAME")
-        )?;
-    }
-    write!(
-        rustfmt_stdin,
-        "
-        use zbus::dbus_proxy;
-        "
-    )?;
-    for iface in &needed_ifaces {
-        writeln!(rustfmt_stdin)?;
-        let gen = GenTrait {
-            interface: iface,
-            service: service.as_ref(),
-            path: path.as_ref(),
-        }
-        .to_string();
-        rustfmt_stdin.write_all(gen.as_bytes())?;
-    }
-    process.wait()?;
-    Ok(())
 }

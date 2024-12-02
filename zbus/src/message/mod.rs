@@ -1,45 +1,28 @@
 //! D-Bus Message.
-use std::{fmt, num::NonZeroU32, sync::Arc};
-
-#[cfg(unix)]
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::{fmt, sync::Arc};
 
 use static_assertions::assert_impl_all;
 use zbus_names::{ErrorName, InterfaceName, MemberName};
+use zvariant::{serialized, Endian};
 
-#[cfg(unix)]
-use crate::OwnedFd;
-use crate::{
-    utils::padding_for_8_bytes,
-    zvariant::{EncodingContext, ObjectPath, Signature, Type as VariantType},
-    Error, Result,
-};
+use crate::{utils::padding_for_8_bytes, zvariant::ObjectPath, Error, Result};
 
 mod builder;
 pub use builder::Builder;
 
-mod field;
-use field::{Field, FieldCode};
+mod field_code;
+pub(crate) use field_code::FieldCode;
 
 mod fields;
-use fields::{Fields, QuickFields};
+pub(crate) use fields::Fields;
+use fields::QuickFields;
+
+mod body;
+pub use body::Body;
 
 pub(crate) mod header;
-use header::MIN_MESSAGE_SIZE;
 pub use header::{EndianSig, Flags, Header, PrimaryHeader, Type, NATIVE_ENDIAN_SIG};
-
-macro_rules! dbus_context {
-    ($n_bytes_before: expr) => {
-        EncodingContext::<byteorder::NativeEndian>::new_dbus($n_bytes_before)
-    };
-}
-
-#[cfg(unix)]
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) enum Fds {
-    Owned(Vec<OwnedFd>),
-    Raw(Vec<RawFd>),
-}
+use header::{MIN_MESSAGE_SIZE, PRIMARY_HEADER_SIZE};
 
 /// A position in the stream of [`Message`] objects received by a single [`zbus::Connection`].
 ///
@@ -57,52 +40,70 @@ impl Sequence {
 
 /// A D-Bus Message.
 ///
-/// The content of the message are stored in serialized format. To deserialize the body of the
-/// message, use the [`body`] method. You may also access the header and other details with the
-/// various other getters.
+/// The contents of the message are stored in serialized format. To get the body of the message, use
+/// the [`Message::body`] method, and use [`Body`] methods to deserialize it. You may also access
+/// the header and other details with the various other getters.
 ///
 /// Also provided are constructors for messages of different types. These will mainly be useful for
 /// very advanced use cases as typically you will want to create a message for immediate dispatch
 /// and hence use the API provided by [`Connection`], even when using the low-level API.
 ///
 /// **Note**: The message owns the received FDs and will close them when dropped. You can
-/// deserialize to [`OwnedFd`] using [`body`] if you want to keep the FDs around after the
-/// containing message is dropped.
+/// deserialize the body (that you get using [`Message::body`]) to [`zvariant::OwnedFd`] if you want
+/// to keep the FDs around after the containing message is dropped.
 ///
-/// [`body`]: #method.body
 /// [`Connection`]: struct.Connection#method.call_method
 #[derive(Clone)]
 pub struct Message {
-    inner: Arc<Inner>,
+    pub(super) inner: Arc<Inner>,
 }
 
 pub(super) struct Inner {
     pub(crate) primary_header: PrimaryHeader,
-    pub(crate) quick_fields: QuickFields,
-    pub(crate) bytes: Vec<u8>,
+    pub(crate) quick_fields: std::sync::OnceLock<QuickFields>,
+    pub(crate) bytes: serialized::Data<'static, 'static>,
     pub(crate) body_offset: usize,
-    #[cfg(unix)]
-    pub(crate) fds: Fds,
     pub(crate) recv_seq: Sequence,
 }
 
 assert_impl_all!(Message: Send, Sync, Unpin);
 
-// TODO: Handle non-native byte order: https://github.com/dbus2/zbus/issues/19
 impl Message {
-    /// Create a builder for message of type [`Type::MethodCall`].
-    pub fn method<'b, 'p: 'b, 'm: 'b, P, M>(path: P, method_name: M) -> Result<Builder<'b>>
+    pub fn into_body(self) -> Body {
+        Body::new(self.inner.bytes.slice(self.inner.body_offset..), self)
+    }
+    pub fn signature(&self) -> &zvariant::Signature {
+        self.quick_fields().signature()
+    }
+    pub fn interface(&self) -> Option<InterfaceName<'_>> {
+        self.quick_fields().interface(self)
+    }
+    pub fn member(&self) -> Option<MemberName<'_>> {
+        self.quick_fields().member(self)
+    }
+    pub fn path(&self) -> Option<zvariant::ObjectPath<'_>> {
+        self.quick_fields().path(self)
+    }
+    pub fn sender(&self) -> Option<zbus_names::UniqueName<'_>> {
+        self.quick_fields().sender(self)
+    }
+}
+
+impl Message {
+    /// Create a builder for a message of type [`Type::MethodCall`].
+    pub fn method_call<'b, 'p: 'b, 'm: 'b, P, M>(path: P, method_name: M) -> Result<Builder<'b>>
     where
         P: TryInto<ObjectPath<'p>>,
         M: TryInto<MemberName<'m>>,
         P::Error: Into<Error>,
         M::Error: Into<Error>,
     {
-        #[allow(deprecated)]
-        Builder::method_call(path, method_name)
+        Builder::new(Type::MethodCall)
+            .path(path)?
+            .member(method_name)
     }
 
-    /// Create a builder for message of type [`Type::Signal`].
+    /// Create a builder for a message of type [`Type::Signal`].
     pub fn signal<'b, 'p: 'b, 'i: 'b, 'm: 'b, P, I, M>(
         path: P,
         iface: I,
@@ -116,67 +117,59 @@ impl Message {
         I::Error: Into<Error>,
         M::Error: Into<Error>,
     {
-        #[allow(deprecated)]
-        Builder::signal(path, iface, signal_name)
+        Builder::new(Type::Signal)
+            .path(path)?
+            .interface(iface)?
+            .member(signal_name)
     }
 
-    /// Create a builder for message of type [`Type::MethodReturn`].
-    pub fn method_reply(call: &Self) -> Result<Builder<'_>> {
-        #[allow(deprecated)]
-        Builder::method_return(&call.header())
+    /// Create a builder for a message of type [`Type::MethodReturn`].
+    pub fn method_return(reply_to: &Header<'_>) -> Result<Builder<'static>> {
+        Builder::new(Type::MethodReturn).reply_to(reply_to)
     }
 
-    /// Create a builder for message of type [`Type::Error`].
-    pub fn method_error<'b, 'e: 'b, E>(call: &Self, name: E) -> Result<Builder<'b>>
+    /// Create a builder for a message of type [`Type::Error`].
+    pub fn error<'b, 'e: 'b, E>(reply_to: &Header<'_>, name: E) -> Result<Builder<'b>>
     where
         E: TryInto<ErrorName<'e>>,
         E::Error: Into<Error>,
     {
-        #[allow(deprecated)]
-        Builder::error(&call.header(), name)
+        Builder::new(Type::Error)
+            .reply_to(reply_to)?
+            .error_name(name)
     }
 
     /// Create a message from bytes.
     ///
-    /// The `fds` parameter is only available on unix. It specifies the file descriptors that
-    /// accompany the message. On the wire, values of the UNIX_FD types store the index of the
-    /// corresponding file descriptor in this vector. Passing an empty vector on a message that
-    /// has UNIX_FD will result in an error.
-    ///
-    /// **Note:** Since the constructed message is not construct by zbus, the receive sequence,
+    /// **Note:** Since the message is not constructed by zbus, the receive sequence,
     /// which can be acquired from [`Message::recv_position`], is not applicable and hence set
     /// to `0`.
     ///
     /// # Safety
     ///
     /// This method is unsafe as bytes may have an invalid encoding.
-    pub unsafe fn from_bytes(bytes: Vec<u8>, #[cfg(unix)] fds: Vec<OwnedFd>) -> Result<Self> {
-        Self::from_raw_parts(
-            bytes,
-            #[cfg(unix)]
-            fds,
-            0,
-        )
+    pub unsafe fn from_bytes(bytes: serialized::Data<'static, 'static>) -> Result<Self> {
+        Self::from_raw_parts(bytes, 0)
     }
 
-    /// Create a message from its full contents
+    /// Create a message from its full contents.
     pub(crate) fn from_raw_parts(
-        bytes: Vec<u8>,
-        #[cfg(unix)] fds: Vec<OwnedFd>,
+        bytes: serialized::Data<'static, 'static>,
         recv_seq: u64,
     ) -> Result<Self> {
-        if EndianSig::try_from(bytes[0])? != NATIVE_ENDIAN_SIG {
+        let endian = Endian::from(EndianSig::try_from(bytes[0])?);
+        if endian != bytes.context().endian() {
             return Err(Error::IncorrectEndian);
         }
 
-        let (primary_header, fields_len) = PrimaryHeader::read(&bytes)?;
-        let (header, _) = zvariant::from_slice(&bytes, dbus_context!(0))?;
-        #[cfg(unix)]
-        let fds = Fds::Owned(fds);
+        let (primary_header, fields_len) = PrimaryHeader::read_from_data(&bytes)?;
+        let fields_bytes = bytes.slice(PRIMARY_HEADER_SIZE..);
+        let (fields, _) = fields_bytes.deserialize()?;
+        let header = Header::new(primary_header.clone(), fields);
 
         let header_len = MIN_MESSAGE_SIZE + fields_len as usize;
         let body_offset = header_len + padding_for_8_bytes(header_len);
-        let quick_fields = QuickFields::new(&bytes, &header)?;
+        let quick_fields = QuickFields::new(&bytes, &header).into();
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -184,21 +177,9 @@ impl Message {
                 quick_fields,
                 bytes,
                 body_offset,
-                #[cfg(unix)]
-                fds,
                 recv_seq: Sequence { recv_seq },
             }),
         })
-    }
-
-    /// The signature of the body.
-    ///
-    /// **Note:** While zbus treats multiple arguments as a struct (to allow you to use the tuple
-    /// syntax), D-Bus does not. Since this method gives you the signature expected on the wire by
-    /// D-Bus, the trailing and leading STRUCT signature parenthesis will not be present in case of
-    /// multiple arguments.
-    pub fn body_signature(&self) -> Option<Signature<'_>> {
-        self.inner.quick_fields.signature(self)
     }
 
     pub fn primary_header(&self) -> &PrimaryHeader {
@@ -206,40 +187,19 @@ impl Message {
     }
 
     /// The message header.
-    ///
-    /// Note: This method does not deserialize the header but it does currently allocate so its not
-    /// zero-cost. While the allocation is small and will hopefully be removed in the future, it's
-    /// best to keep the header around if you need to access it a lot.
     pub fn header(&self) -> Header<'_> {
-        let mut fields = Fields::new();
-        let quick_fields = &self.inner.quick_fields;
-        if let Some(p) = quick_fields.path(self) {
-            fields.add(Field::Path(p));
-        }
-        if let Some(i) = quick_fields.interface(self) {
-            fields.add(Field::Interface(i));
-        }
-        if let Some(m) = quick_fields.member(self) {
-            fields.add(Field::Member(m));
-        }
-        if let Some(e) = quick_fields.error_name(self) {
-            fields.add(Field::ErrorName(e));
-        }
-        if let Some(r) = quick_fields.reply_serial() {
-            fields.add(Field::ReplySerial(r));
-        }
-        if let Some(d) = quick_fields.destination(self) {
-            fields.add(Field::Destination(d));
-        }
-        if let Some(s) = quick_fields.sender(self) {
-            fields.add(Field::Sender(s));
-        }
-        if let Some(s) = quick_fields.signature(self) {
-            fields.add(Field::Signature(s));
-        }
-        if let Some(u) = quick_fields.unix_fds() {
-            fields.add(Field::UnixFDs(u));
-        }
+        let quick_fields = self.quick_fields();
+        let fields = Fields {
+            path: quick_fields.path(self),
+            interface: quick_fields.interface(self),
+            member: quick_fields.member(self),
+            error_name: quick_fields.error_name(self),
+            reply_serial: quick_fields.reply_serial(),
+            destination: quick_fields.destination(self),
+            sender: quick_fields.sender(self),
+            signature: std::borrow::Cow::Borrowed(quick_fields.signature()),
+            unix_fds: quick_fields.unix_fds(),
+        };
 
         Header::new(self.inner.primary_header.clone(), fields)
     }
@@ -249,57 +209,7 @@ impl Message {
         self.inner.primary_header.msg_type()
     }
 
-    /// The object to send a call to, or the object a signal is emitted from.
-    #[deprecated(note = "Use `Message::header` with `message::Header::path` instead")]
-    pub fn path(&self) -> Option<ObjectPath<'_>> {
-        self.inner.quick_fields.path(self)
-    }
-
-    /// The interface to invoke a method call on, or that a signal is emitted from.
-    #[deprecated(note = "Use `Message::header` with `message::Header::interface` instead")]
-    pub fn interface(&self) -> Option<InterfaceName<'_>> {
-        self.inner.quick_fields.interface(self)
-    }
-
-    /// The member, either the method name or signal name.
-    #[deprecated(note = "Use `Message::header` with `message::Header::member` instead")]
-    pub fn member(&self) -> Option<MemberName<'_>> {
-        self.inner.quick_fields.member(self)
-    }
-
-    /// The serial number of the message this message is a reply to.
-    #[deprecated(note = "Use `Message::header` with `message::Header::reply_serial` instead")]
-    pub fn reply_serial(&self) -> Option<NonZeroU32> {
-        self.inner.quick_fields.reply_serial()
-    }
-
-    /// Deserialize the body (without checking signature matching).
-    pub fn body_unchecked<'d, 'm: 'd, B>(&'m self) -> Result<B>
-    where
-        B: serde::de::Deserialize<'d> + VariantType,
-    {
-        {
-            #[cfg(unix)]
-            {
-                zvariant::from_slice_fds(
-                    &self.inner.bytes[self.inner.body_offset..],
-                    Some(&self.fds()),
-                    dbus_context!(0),
-                )
-            }
-            #[cfg(not(unix))]
-            {
-                zvariant::from_slice(
-                    &self.inner.bytes[self.inner.body_offset..],
-                    dbus_context!(0),
-                )
-            }
-        }
-        .map_err(Error::from)
-        .map(|b| b.0)
-    }
-
-    /// Deserialize the body using the contained signature.
+    /// The body that you can deserialize using [`Body::deserialize`].
     ///
     /// # Example
     ///
@@ -307,81 +217,57 @@ impl Message {
     /// # use zbus::message::Message;
     /// # (|| -> zbus::Result<()> {
     /// let send_body = (7i32, (2i32, "foo"), vec!["bar"]);
-    /// let message = Message::method("/", "ping")?
+    /// let message = Message::method_call("/", "ping")?
     ///     .destination("zbus.test")?
     ///     .interface("zbus.test")?
     ///     .build(&send_body)?;
-    /// let body : zbus::zvariant::Structure = message.body()?;
+    /// let header = message.header();
+    /// let body = message.body();
+    /// let body: zbus::zvariant::Structure = body.deserialize()?;
     /// let fields = body.fields();
     /// assert!(matches!(fields[0], zvariant::Value::I32(7)));
     /// assert!(matches!(fields[1], zvariant::Value::Structure(_)));
     /// assert!(matches!(fields[2], zvariant::Value::Array(_)));
     ///
-    /// let reply_msg = Message::method_reply(&message)?.build(&body)?;
-    /// let reply_value : (i32, (i32, &str), Vec<String>) = reply_msg.body()?;
+    /// let reply_body = Message::method_return(&header)?.build(&body)?.body();
+    /// let reply_value : (i32, (i32, &str), Vec<String>) = reply_body.deserialize()?;
     ///
     /// assert_eq!(reply_value.0, 7);
     /// assert_eq!(reply_value.2.len(), 1);
     /// # Ok(()) })().unwrap()
     /// ```
-    pub fn body<'d, 'm: 'd, B>(&'m self) -> Result<B>
-    where
-        B: zvariant::DynamicDeserialize<'d>,
-    {
-        let body_sig = self
-            .body_signature()
-            .unwrap_or_else(|| Signature::from_static_str_unchecked(""));
-
-        {
-            #[cfg(unix)]
-            {
-                zvariant::from_slice_fds_for_dynamic_signature(
-                    &self.inner.bytes[self.inner.body_offset..],
-                    Some(&self.fds()),
-                    dbus_context!(0),
-                    &body_sig,
-                )
-            }
-            #[cfg(not(unix))]
-            {
-                zvariant::from_slice_for_dynamic_signature(
-                    &self.inner.bytes[self.inner.body_offset..],
-                    dbus_context!(0),
-                    &body_sig,
-                )
-            }
-        }
-        .map_err(Error::from)
-        .map(|b| b.0)
+    pub fn body(&self) -> Body {
+        Body::new(
+            self.inner.bytes.slice(self.inner.body_offset..),
+            self.clone(),
+        )
     }
 
-    #[cfg(unix)]
-    pub(crate) fn fds(&self) -> Vec<RawFd> {
-        match &self.inner.fds {
-            Fds::Raw(fds) => fds.clone(),
-            Fds::Owned(fds) => fds.iter().map(|f| f.as_raw_fd()).collect(),
-        }
-    }
-
-    /// Get a reference to the byte encoding of the message.
-    pub fn as_bytes(&self) -> &[u8] {
+    /// Get a reference to the underlying byte encoding of the message.
+    pub fn data(&self) -> &serialized::Data<'static, 'static> {
         &self.inner.bytes
-    }
-
-    /// Get a reference to the byte encoding of the body of the message.
-    pub fn body_as_bytes(&self) -> Result<&[u8]> {
-        Ok(&self.inner.bytes[self.inner.body_offset..])
     }
 
     /// Get the receive ordering of a message.
     ///
-    /// This may be used to identify how two events were ordered on the bus.  It only produces a
+    /// This may be used to identify how two events were ordered on the bus. It only produces a
     /// useful ordering for messages that were produced by the same [`zbus::Connection`].
     ///
     /// This is completely unrelated to the serial number on the message, which is set by the peer
     /// and might not be ordered at all.
     pub fn recv_position(&self) -> Sequence {
         self.inner.recv_seq
+    }
+
+    fn quick_fields(&self) -> &QuickFields {
+        self.inner.quick_fields.get_or_init(|| {
+            let bytes = &self.inner.bytes;
+            // SAFETY: We ensure that by the time `quick_fields` is called, the header has already
+            // been checked.
+            let (header, _): (Header<'_>, _) = bytes.deserialize().unwrap();
+
+            QuickFields::new(bytes, &header)
+        })
     }
 }
 
@@ -390,6 +276,7 @@ impl fmt::Debug for Message {
         let mut msg = f.debug_struct("Msg");
         let h = self.header();
         msg.field("type", &h.message_type());
+        msg.field("serial", &self.primary_header().serial_num());
         if let Some(sender) = h.sender() {
             msg.field("sender", &sender);
         }
@@ -405,15 +292,15 @@ impl fmt::Debug for Message {
         if let Some(member) = h.member() {
             msg.field("member", &member);
         }
-        if let Some(s) = self.body_signature() {
-            msg.field("body", &s);
+        match self.body().signature() {
+            zvariant::Signature::Unit => (),
+            s => {
+                msg.field("body", &s);
+            }
         }
         #[cfg(unix)]
         {
-            let fds = self.fds();
-            if !fds.is_empty() {
-                msg.field("fds", &fds);
-            }
+            msg.field("fds", &self.data().fds());
         }
         msg.finish()
     }
@@ -445,7 +332,8 @@ impl fmt::Display for Message {
                     write!(f, " {e}")?;
                 }
 
-                let msg = self.body_unchecked::<&str>();
+                let body = self.body();
+                let msg = body.deserialize_unchecked::<&str>();
                 if let Ok(msg) = msg {
                     write!(f, ": {msg}")?;
                 }
@@ -469,13 +357,12 @@ impl fmt::Display for Message {
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use std::os::unix::io::AsRawFd;
+    use std::os::fd::{AsFd, AsRawFd};
     use test_log::test;
     #[cfg(unix)]
     use zvariant::Fd;
+    use zvariant::Signature;
 
-    #[cfg(unix)]
-    use super::Fds;
     use super::Message;
     use crate::Error;
 
@@ -483,7 +370,7 @@ mod tests {
     fn test() {
         #[cfg(unix)]
         let stdout = std::io::stdout();
-        let m = Message::method("/", "do")
+        let m = Message::method_call("/", "do")
             .unwrap()
             .sender(":1.72")
             .unwrap()
@@ -493,26 +380,34 @@ mod tests {
                 "foo",
             ))
             .unwrap();
-        assert_eq!(
-            m.body_signature().unwrap().to_string(),
-            if cfg!(unix) { "hs" } else { "s" }
-        );
         #[cfg(unix)]
-        assert_eq!(m.inner.fds, Fds::Raw(vec![stdout.as_raw_fd()]));
+        assert_eq!(
+            m.body().signature(),
+            &Signature::static_structure(&[&Signature::Fd, &Signature::Str]),
+        );
+        #[cfg(not(unix))]
+        assert_eq!(m.body().signature().unwrap(), &Signature::Str,);
+        #[cfg(unix)]
+        {
+            let fds = m.data().fds();
+            assert_eq!(fds.len(), 1);
+            // FDs get dup'ed so it has to be a different FD now.
+            assert_ne!(fds[0].as_fd().as_raw_fd(), stdout.as_raw_fd());
+        }
 
-        let body: Result<u32, Error> = m.body();
+        let body: Result<u32, Error> = m.body().deserialize();
         assert!(matches!(
             body.unwrap_err(),
             Error::Variant(zvariant::Error::SignatureMismatch { .. })
         ));
 
         assert_eq!(m.to_string(), "Method call do from :1.72");
-        let r = Message::method_reply(&m)
+        let r = Message::method_return(&m.header())
             .unwrap()
             .build(&("all fine!"))
             .unwrap();
         assert_eq!(r.to_string(), "Method return");
-        let e = Message::method_error(&m, "org.freedesktop.zbus.Error")
+        let e = Message::error(&m.header(), "org.freedesktop.zbus.Error")
             .unwrap()
             .build(&("kaboom!", 32))
             .unwrap();

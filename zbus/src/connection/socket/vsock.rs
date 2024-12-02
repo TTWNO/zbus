@@ -16,6 +16,10 @@ impl super::ReadHalf for std::sync::Arc<async_io::Async<vsock::VsockStream>> {
             }
         }
     }
+
+    fn auth_mechanism(&self) -> crate::AuthMechanism {
+        crate::AuthMechanism::Anonymous
+    }
 }
 
 #[cfg(all(feature = "vsock", not(feature = "tokio")))]
@@ -24,7 +28,7 @@ impl super::WriteHalf for std::sync::Arc<async_io::Async<vsock::VsockStream>> {
     async fn sendmsg(
         &mut self,
         buf: &[u8],
-        #[cfg(unix)] fds: &[std::os::unix::io::RawFd],
+        #[cfg(unix)] fds: &[std::os::fd::BorrowedFd<'_>],
     ) -> std::io::Result<usize> {
         use std::io;
 
@@ -39,7 +43,7 @@ impl super::WriteHalf for std::sync::Arc<async_io::Async<vsock::VsockStream>> {
         futures_util::AsyncWriteExt::write(&mut self.as_ref(), buf).await
     }
 
-    async fn close(&self) -> io::Result<()> {
+    async fn close(&mut self) -> std::io::Result<()> {
         let stream = self.clone();
         crate::Task::spawn_blocking(
             move || stream.get_ref().shutdown(std::net::Shutdown::Both),
@@ -51,11 +55,11 @@ impl super::WriteHalf for std::sync::Arc<async_io::Async<vsock::VsockStream>> {
 
 #[cfg(feature = "tokio-vsock")]
 impl Socket for tokio_vsock::VsockStream {
-    type ReadHalf = tokio_vsock::ReadHalf;
-    type WriteHalf = tokio_vsock::WriteHalf;
+    type ReadHalf = tokio_vsock::OwnedReadHalf;
+    type WriteHalf = tokio_vsock::OwnedWriteHalf;
 
     fn split(self) -> Split<Self::ReadHalf, Self::WriteHalf> {
-        let (read, write) = self.split();
+        let (read, write) = self.into_split();
 
         Split { read, write }
     }
@@ -63,7 +67,7 @@ impl Socket for tokio_vsock::VsockStream {
 
 #[cfg(feature = "tokio-vsock")]
 #[async_trait::async_trait]
-impl super::ReadHalf for tokio_vsock::ReadHalf {
+impl super::ReadHalf for tokio_vsock::OwnedReadHalf {
     async fn recvmsg(&mut self, buf: &mut [u8]) -> super::RecvmsgResult {
         use tokio::io::{AsyncReadExt, ReadBuf};
 
@@ -76,15 +80,19 @@ impl super::ReadHalf for tokio_vsock::ReadHalf {
             ret
         })
     }
+
+    fn auth_mechanism(&self) -> crate::conn::AuthMechanism {
+        crate::conn::AuthMechanism::Anonymous
+    }
 }
 
 #[cfg(feature = "tokio-vsock")]
 #[async_trait::async_trait]
-impl super::WriteHalf for tokio_vsock::WriteHalf {
+impl super::WriteHalf for tokio_vsock::OwnedWriteHalf {
     async fn sendmsg(
         &mut self,
         buf: &[u8],
-        #[cfg(unix)] fds: &[std::os::unix::io::RawFd],
+        #[cfg(unix)] fds: &[std::os::fd::BorrowedFd<'_>],
     ) -> std::io::Result<usize> {
         use std::io;
         use tokio::io::AsyncWriteExt;

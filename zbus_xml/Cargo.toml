@@ -1,9 +1,9 @@
 [package]
 name = "zbus_xml"
-version = "4.0.0"
+version = "5.0.1"
 authors = ["Zeeshan Ali Khan <zeeshanak@gnome.org>"]
 edition = "2021"
-rust-version = "1.66"
+rust-version = "1.80"
 
 description = "API to handle D-Bus introspection XML"
 repository = "https://github.com/dbus2/zbus/"
@@ -13,10 +13,10 @@ categories = ["parsing"]
 readme = "README.md"
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
-zvariant = { path = "../zvariant", version = "4.0.0", default-features = false }
-zbus_names = { path = "../zbus_names", version = "3.0" }
-quick-xml = { version = "0.30", features = ["serialize", "overlapped-lists"] }
+serde = { version = "1.0.200", features = ["derive"] }
+zvariant = { path = "../zvariant", version = "5.0.0", default-features = false }
+zbus_names = { path = "../zbus_names", version = "4.0" }
+quick-xml = { version = "0.36", features = ["serialize", "overlapped-lists"] }
 static_assertions = "1.1.0"
 
 [dev-dependencies]
@@ -25,3 +25,6 @@ doc-comment = "0.3.3"
 [package.metadata.docs.rs]
 all-features = true
 targets = ["x86_64-unknown-linux-gnu"]
+
+[lints]
+workspace = true

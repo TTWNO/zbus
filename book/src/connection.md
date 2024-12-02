@@ -1,5 +1,7 @@
 # Establishing a connection
 
+<!-- toc -->
+
 The first thing you will have to do is to connect to a D-Bus bus or to a D-Bus peer. This is the
 entry point of the zbus API.
 
@@ -17,10 +19,6 @@ more appropriate for your use case.
 **Note:** it is common for a D-Bus library to provide a "shared" connection to a bus for a process:
 all `session()` share the same underlying connection for example. At the time of this writing,
 zbus doesn't do that.
-
-**Note:** on Windows, there is no standard implicit way to connect to a session bus. zbus provides
-opt-in compatibility to the GDBus session bus discovery mechanism via the `windows-gdbus` feature.
-This mechanism uses a machine-wide mutex however, so only one GDBus session bus can run at a time.
 
 **Note:** on macOS, there is no standard implicit way to connect to a session bus. zbus provides
 opt-in compatibility to the Launchd session bus discovery mechanism via the `launchctl getenv` feature.
@@ -59,7 +57,7 @@ let (client_conn, server_conn) = futures_util::try_join!(
     // Client
     Builder::unix_stream(p0).p2p().build(),
     // Server
-    Builder::unix_stream(p1).server(&guid).p2p().build(),
+    Builder::unix_stream(p1).server(guid)?.p2p().build(),
 )?;
 # }
 #
@@ -67,12 +65,15 @@ let (client_conn, server_conn) = futures_util::try_join!(
 # }
 ```
 
+**Note:** the `p2p` and `server` methods of `connection::Builder` are only available when `p2p`
+cargo feature of `zbus` is enabled.
+
 [NetworkManager]: https://developer.gnome.org/NetworkManager/stable/spec.html
 [BlueZ]: https://git.kernel.org/pub/scm/bluetooth/bluez.git/tree/doc
-[PID1]: https://www.freedesktop.org/wiki/Software/systemd/dbus/
-[`futures::stream::Stream`]: https://docs.rs/futures/latest/futures/stream/trait.Stream.html
-[`MessageStream`]: https://docs.rs/zbus/latest/zbus/struct.MessageStream.html
-[`Builder::address`]: https://docs.rs/zbus/latest/zbus/connection/struct.ConnectionBuilder.html#method.address
+[PID1]: https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.systemd1.html
+[`futures::stream::Stream`]: https://docs.rs/futures/4/futures/stream/trait.Stream.html
+[`MessageStream`]: https://docs.rs/zbus/5/zbus/struct.MessageStream.html
+[`connection::Builder::address`]: https://docs.rs/zbus/5/zbus/connection/struct.Builder.html#method.address
 [dspec]: https://dbus.freedesktop.org/doc/dbus-specification.html#addresses
 
-[^bus-less] Unless you implemented them, none of the bus methods will exist.
+[^bus-less]: Unless you implemented them, none of the bus methods will exist.

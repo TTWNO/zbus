@@ -3,12 +3,16 @@
 use enumflags2::BitFlags;
 use futures_util::StreamExt;
 use static_assertions::assert_impl_all;
-use std::ops::Deref;
+use std::{fmt, ops::Deref};
 use zbus_names::{BusName, InterfaceName, MemberName, UniqueName};
 use zvariant::{ObjectPath, OwnedValue, Value};
 
 use crate::{
-    blocking::Connection, message::Message, proxy::MethodFlags, utils::block_on, Error, Result,
+    blocking::Connection,
+    message::Message,
+    proxy::{Defaults, MethodFlags},
+    utils::block_on,
+    Error, Result,
 };
 
 use crate::fdo;
@@ -39,31 +43,38 @@ pub use builder::Builder;
 ///     // owned return value
 ///     let _id: String = p.call("GetId", &())?;
 ///     // borrowed return value
-///     let _id: &str = p.call_method("GetId", &())?.body()?;
+///     let body = p.call_method("GetId", &())?.body();
+///     let _id: &str = body.deserialize()?;
 ///     Ok(())
 /// }
 /// ```
 ///
 /// # Note
 ///
-/// It is recommended to use the [`dbus_proxy`] macro, which provides a more convenient and
+/// It is recommended to use the [`proxy`] macro, which provides a more convenient and
 /// type-safe *façade* `Proxy` derived from a Rust trait.
 ///
 /// ## Current limitations:
 ///
 /// At the moment, `Proxy` doesn't prevent [auto-launching][al].
 ///
-/// [`dbus_proxy`]: attr.dbus_proxy.html
+/// [`proxy`]: attr.proxy.html
 /// [al]: https://github.com/dbus2/zbus/issues/54
-#[derive(derivative::Derivative)]
-#[derivative(Clone, Debug)]
+#[derive(Clone)]
 pub struct Proxy<'a> {
-    #[derivative(Debug = "ignore")]
     conn: Connection,
     // Wrap it in an `Option` to ensure the proxy is dropped in a `block_on` call. This is needed
     // for tokio because the proxy spawns a task in its `Drop` impl and that needs a runtime
     // context in case of tokio.
     azync: Option<crate::Proxy<'a>>,
+}
+
+impl fmt::Debug for Proxy<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Proxy")
+            .field("azync", &self.azync)
+            .finish_non_exhaustive()
+    }
 }
 
 assert_impl_all!(Proxy<'_>: Send, Sync, Unpin);
@@ -132,23 +143,23 @@ impl<'a> Proxy<'a> {
     }
 
     /// Get a reference to the destination service name.
-    pub fn destination(&self) -> &BusName<'_> {
+    pub fn destination(&self) -> &BusName<'a> {
         self.inner().destination()
     }
 
     /// Get a reference to the object path.
-    pub fn path(&self) -> &ObjectPath<'_> {
+    pub fn path(&self) -> &ObjectPath<'a> {
         self.inner().path()
     }
 
     /// Get a reference to the interface.
-    pub fn interface(&self) -> &InterfaceName<'_> {
+    pub fn interface(&self) -> &InterfaceName<'a> {
         self.inner().interface()
     }
 
     /// Introspect the associated object, and return the XML description.
     ///
-    /// See the [xml](xml/index.html) module for parsing the result.
+    /// See the [xml](https://docs.rs/zbus_xml) crate for parsing the result.
     pub fn introspect(&self) -> fdo::Result<String> {
         block_on(self.inner().introspect())
     }
@@ -193,9 +204,9 @@ impl<'a> Proxy<'a> {
     /// Set the property `property_name`.
     ///
     /// Effectively, call the `Set` method of the `org.freedesktop.DBus.Properties` interface.
-    pub fn set_property<'t, T: 't>(&self, property_name: &str, value: T) -> fdo::Result<()>
+    pub fn set_property<'t, T>(&self, property_name: &str, value: T) -> fdo::Result<()>
     where
-        T: Into<Value<'t>>,
+        T: 't + Into<Value<'t>>,
     {
         block_on(self.inner().set_property(property_name, value))
     }
@@ -226,7 +237,7 @@ impl<'a> Proxy<'a> {
         M: TryInto<MemberName<'m>>,
         M::Error: Into<Error>,
         B: serde::ser::Serialize + zvariant::DynamicType,
-        R: serde::de::DeserializeOwned + zvariant::Type,
+        R: for<'d> zvariant::DynamicDeserialize<'d>,
     {
         block_on(self.inner().call(method_name, body))
     }
@@ -235,8 +246,8 @@ impl<'a> Proxy<'a> {
     /// method flags to control the way the method call message is sent and handled.
     ///
     /// Use [`call`] instead if you do not need any special handling via additional flags.
-    /// If the `NoReplyExpected` flag is passed , this will return None immediately
-    /// after sending the message, similar to [`call_noreply`]
+    /// If the `NoReplyExpected` flag is passed, this will return None immediately
+    /// after sending the message, similar to [`call_noreply`].
     ///
     /// [`call`]: struct.Proxy.html#method.call
     /// [`call_noreply`]: struct.Proxy.html#method.call_noreply
@@ -250,12 +261,12 @@ impl<'a> Proxy<'a> {
         M: TryInto<MemberName<'m>>,
         M::Error: Into<Error>,
         B: serde::ser::Serialize + zvariant::DynamicType,
-        R: serde::de::DeserializeOwned + zvariant::Type,
+        R: for<'d> zvariant::DynamicDeserialize<'d>,
     {
         block_on(self.inner().call_with_flags(method_name, flags, body))
     }
 
-    /// Call a method without expecting a reply
+    /// Call a method without expecting a reply.
     ///
     /// This sets the `NoReplyExpected` flag on the calling message and does not wait for a reply.
     pub fn call_noreply<'m, M, B>(&self, method_name: M, body: &B) -> Result<()>
@@ -289,7 +300,7 @@ impl<'a> Proxy<'a> {
     /// this method where possible. Note that this filtering is limited to arguments of string
     /// types.
     ///
-    /// The arguments are passed as a tuples of argument index and expected value.
+    /// The arguments are passed as tuples of argument index and expected value.
     pub fn receive_signal_with_args<'m, M>(
         &self,
         signal_name: M,
@@ -339,7 +350,7 @@ impl<'a> Proxy<'a> {
     ///
     /// Note that zbus doesn't queue the updates. If the listener is slower than the receiver, it
     /// will only receive the last update.
-    pub fn receive_owner_changed(&self) -> Result<OwnerChangedIterator<'_>> {
+    pub fn receive_owner_changed(&self) -> Result<OwnerChangedIterator<'a>> {
         block_on(self.inner().receive_owner_changed()).map(OwnerChangedIterator)
     }
 
@@ -352,6 +363,12 @@ impl<'a> Proxy<'a> {
     pub fn into_inner(mut self) -> crate::Proxy<'a> {
         self.azync.take().expect("Inner proxy is `None`")
     }
+}
+
+impl Defaults for Proxy<'_> {
+    const INTERFACE: &'static Option<InterfaceName<'static>> = &None;
+    const DESTINATION: &'static Option<BusName<'static>> = &None;
+    const PATH: &'static Option<ObjectPath<'static>> = &None;
 }
 
 impl<'a> std::convert::AsRef<Proxy<'a>> for Proxy<'a> {
@@ -438,11 +455,11 @@ impl<'a, T> PropertyChanged<'a, T> {
         self.0.name()
     }
 
-    // Get the raw value of the property that changed.
-    //
-    // If the notification signal contained the new value, it has been cached already and this call
-    // will return that value. Otherwise (i-e invalidated property), a D-Bus call is made to fetch
-    // and cache the new value.
+    /// Get the raw value of the property that changed.
+    ///
+    /// If the notification signal contained the new value, it has been cached already and this call
+    /// will return that value. Otherwise (i.e. invalidated property), a D-Bus call is made to fetch
+    /// and cache the new value.
     pub fn get_raw(&self) -> Result<impl Deref<Target = Value<'static>> + '_> {
         block_on(self.0.get_raw())
     }
@@ -453,11 +470,11 @@ where
     T: TryFrom<zvariant::OwnedValue>,
     T::Error: Into<crate::Error>,
 {
-    // Get the value of the property that changed.
-    //
-    // If the notification signal contained the new value, it has been cached already and this call
-    // will return that value. Otherwise (i-e invalidated property), a D-Bus call is made to fetch
-    // and cache the new value.
+    /// Get the value of the property that changed.
+    ///
+    /// If the notification signal contained the new value, it has been cached already and this call
+    /// will return that value. Otherwise (i.e. invalidated property), a D-Bus call is made to fetch
+    /// and cache the new value.
     pub fn get(&self) -> Result<T> {
         block_on(self.0.get())
     }
@@ -468,9 +485,9 @@ where
 /// Use [`Proxy::receive_owner_changed`] to create an instance of this type.
 pub struct OwnerChangedIterator<'a>(crate::proxy::OwnerChangedStream<'a>);
 
-impl OwnerChangedIterator<'_> {
+impl<'a> OwnerChangedIterator<'a> {
     /// The bus name being tracked.
-    pub fn name(&self) -> &BusName<'_> {
+    pub fn name(&self) -> &BusName<'a> {
         self.0.name()
     }
 }
@@ -481,6 +498,22 @@ impl<'a> std::iter::Iterator for OwnerChangedIterator<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         block_on(self.0.next())
     }
+}
+
+/// This trait is implemented by all blocking proxies, which are generated with the
+/// [`proxy`](macro@zbus::proxy) macro.
+pub trait ProxyImpl<'p>
+where
+    Self: Sized,
+{
+    /// Return a customizable builder for this proxy.
+    fn builder(conn: &Connection) -> Builder<'p, Self>;
+
+    /// Consume `self`, returning the underlying `zbus::Proxy`.
+    fn into_inner(self) -> Proxy<'p>;
+
+    /// The reference to the underlying `zbus::Proxy`.
+    fn inner(&self) -> &Proxy<'p>;
 }
 
 #[cfg(test)]
@@ -526,20 +559,4 @@ mod tests {
         // one we subscribed to.
         assert!(signal.args().unwrap().name() == well_known);
     }
-}
-
-/// This trait is implemented by all blocking proxies, which are generated with the
-/// [`dbus_proxy`](zbus::dbus_proxy) macro.
-pub trait ProxyImpl<'p>
-where
-    Self: Sized,
-{
-    /// Returns a customizable builder for this proxy.
-    fn builder(conn: &Connection) -> Builder<'p, Self>;
-
-    /// Consumes `self`, returning the underlying `zbus::Proxy`.
-    fn into_inner(self) -> Proxy<'p>;
-
-    /// The reference to the underlying `zbus::Proxy`.
-    fn inner(&self) -> &Proxy<'p>;
 }

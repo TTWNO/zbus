@@ -1,4 +1,7 @@
-use crate::{utils::impl_try_from, Error, Result};
+use crate::{
+    utils::{impl_str_basic, impl_try_from},
+    Error, Result,
+};
 use serde::{de, Deserialize, Serialize};
 use static_assertions::assert_impl_all;
 use std::{
@@ -40,8 +43,10 @@ pub struct MemberName<'name>(Str<'name>);
 
 assert_impl_all!(MemberName<'_>: Send, Sync, Unpin);
 
+impl_str_basic!(MemberName<'_>);
+
 impl<'name> MemberName<'name> {
-    /// A borrowed clone (never allocates, unlike clone).
+    /// This is faster than `Clone::clone` when `self` contains owned data.
     pub fn as_ref(&self) -> MemberName<'_> {
         MemberName(self.0.as_ref())
     }
@@ -61,7 +66,7 @@ impl<'name> MemberName<'name> {
 
     /// Same as `try_from`, except it takes a `&'static str`.
     pub fn from_static_str(name: &'static str) -> Result<Self> {
-        ensure_correct_member_name(name)?;
+        validate(name)?;
         Ok(Self(Str::from_static(name)))
     }
 
@@ -147,47 +152,43 @@ impl<'name> From<MemberName<'name>> for Str<'name> {
 impl_try_from! {
     ty: MemberName<'s>,
     owned_ty: OwnedMemberName,
-    validate_fn: ensure_correct_member_name,
+    validate_fn: validate,
     try_from: [&'s str, String, Arc<str>, Cow<'s, str>, Str<'s>],
 }
 
-fn ensure_correct_member_name(name: &str) -> Result<()> {
+fn validate(name: &str) -> Result<()> {
+    validate_bytes(name.as_bytes()).map_err(|_| {
+        Error::InvalidName(
+            "Invalid member name. See \
+            https://dbus.freedesktop.org/doc/dbus-specification.html#message-protocol-names-member",
+        )
+    })
+}
+
+pub(crate) fn validate_bytes(bytes: &[u8]) -> std::result::Result<(), ()> {
+    use winnow::{
+        stream::AsChar,
+        token::{one_of, take_while},
+        Parser,
+    };
     // Rules
     //
     // * Only ASCII alphanumeric or `_`.
     // * Must not begin with a digit.
     // * Must contain at least 1 character.
     // * <= 255 characters.
-    if name.is_empty() {
-        return Err(Error::InvalidMemberName(format!(
-            "`{}` is {} characters long, which is smaller than minimum allowed (1)",
-            name,
-            name.len(),
-        )));
-    } else if name.len() > 255 {
-        return Err(Error::InvalidMemberName(format!(
-            "`{}` is {} characters long, which is longer than maximum allowed (255)",
-            name,
-            name.len(),
-        )));
-    }
+    let first_element_char = one_of((AsChar::is_alpha, b'_'));
+    let subsequent_element_chars = take_while::<_, _, ()>(0.., (AsChar::is_alphanum, b'_'));
+    let mut member_name = (first_element_char, subsequent_element_chars);
 
-    // SAFETY: We established above that there is at least 1 character so unwrap is fine.
-    if name.chars().next().unwrap().is_ascii_digit() {
-        return Err(Error::InvalidMemberName(String::from(
-            "must not start with a digit",
-        )));
-    }
-
-    for c in name.chars() {
-        if !c.is_ascii_alphanumeric() && c != '_' {
-            return Err(Error::InvalidMemberName(format!(
-                "`{c}` character not allowed"
-            )));
+    member_name.parse(bytes).map_err(|_| ()).and_then(|_| {
+        // Least likely scenario so we check this last.
+        if bytes.len() > 255 {
+            return Err(());
         }
-    }
 
-    Ok(())
+        Ok(())
+    })
 }
 
 /// This never succeeds but is provided so it's easier to pass `Option::None` values for API
@@ -220,6 +221,8 @@ pub struct OwnedMemberName(#[serde(borrow)] MemberName<'static>);
 
 assert_impl_all!(OwnedMemberName: Send, Sync, Unpin);
 
+impl_str_basic!(OwnedMemberName);
+
 impl OwnedMemberName {
     /// Convert to the inner `MemberName`, consuming `self`.
     pub fn into_inner(self) -> MemberName<'static> {
@@ -246,7 +249,7 @@ impl Borrow<str> for OwnedMemberName {
     }
 }
 
-impl From<OwnedMemberName> for MemberName<'static> {
+impl From<OwnedMemberName> for MemberName<'_> {
     fn from(o: OwnedMemberName) -> Self {
         o.into_inner()
     }
@@ -264,7 +267,7 @@ impl From<MemberName<'_>> for OwnedMemberName {
     }
 }
 
-impl From<OwnedMemberName> for Str<'static> {
+impl From<OwnedMemberName> for Str<'_> {
     fn from(value: OwnedMemberName) -> Self {
         value.into_inner().0
     }

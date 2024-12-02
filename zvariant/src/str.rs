@@ -7,18 +7,26 @@ use std::{
     sync::Arc,
 };
 
-use crate::{Basic, EncodingFormat, Signature, Type};
+use crate::{Basic, Type};
 
 /// A string wrapper.
 ///
-/// This is used for keeping strings in a [`Value`]. API is provided to convert from, and to a
-/// [`&str`] and [`String`].
+///
+/// This is very similar to the [`std::borrow::Cow`] type, but it:
+///
+/// * is specialized for strings.
+/// * treats `&'static str` as a separate type. This allows you to avoid allocations and copying
+///   when turning an `Str` instance created  from a `&'static str` into an owned version in generic
+///   code that doesn't/can't assume the inner lifetime of the source `Str` instance.
+///
+/// This type is used for keeping strings in a [`Value`], among other things.
+///
+/// API is provided to convert from, and to a [`&str`] and [`String`].
 ///
 /// [`Value`]: enum.Value.html#variant.Str
 /// [`&str`]: https://doc.rust-lang.org/std/str/index.html
 /// [`String`]: https://doc.rust-lang.org/std/string/struct.String.html
 #[derive(Default, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Serialize, Deserialize)]
-#[serde(rename(serialize = "zvariant::Str", deserialize = "zvariant::Str"))]
 pub struct Str<'a>(#[serde(borrow)] Inner<'a>);
 
 #[derive(Eq, Clone)]
@@ -92,7 +100,7 @@ impl<'a> Str<'a> {
         Str(Inner::Static(s))
     }
 
-    /// A borrowed clone (this never allocates, unlike clone).
+    /// This is faster than `Clone::clone` when `self` contains owned data.
     pub fn as_ref(&self) -> Str<'_> {
         match &self.0 {
             Inner::Static(s) => Str(Inner::Static(s)),
@@ -124,16 +132,10 @@ impl<'a> Str<'a> {
 impl<'a> Basic for Str<'a> {
     const SIGNATURE_CHAR: char = <&str>::SIGNATURE_CHAR;
     const SIGNATURE_STR: &'static str = <&str>::SIGNATURE_STR;
-
-    fn alignment(format: EncodingFormat) -> usize {
-        <&str>::alignment(format)
-    }
 }
 
 impl<'a> Type for Str<'a> {
-    fn signature() -> Signature<'static> {
-        Signature::from_static_str_unchecked(Self::SIGNATURE_STR)
-    }
+    const SIGNATURE: &'static crate::Signature = &crate::Signature::Str;
 }
 
 impl<'a> From<&'a str> for Str<'a> {
@@ -179,8 +181,8 @@ impl<'a> From<Str<'a>> for String {
     }
 }
 
-impl<'a> From<&'a Str<'a>> for &'a str {
-    fn from(value: &'a Str<'a>) -> &'a str {
+impl<'a> From<&'a Str<'_>> for &'a str {
+    fn from(value: &'a Str<'_>) -> &'a str {
         value.as_str()
     }
 }

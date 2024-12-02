@@ -1,3 +1,12 @@
+macro_rules! impl_str_basic {
+    ($type:ty) => {
+        impl zvariant::Basic for $type {
+            const SIGNATURE_CHAR: char = <zvariant::Str<'_>>::SIGNATURE_CHAR;
+            const SIGNATURE_STR: &'static str = <zvariant::Str<'_>>::SIGNATURE_STR;
+        }
+    };
+}
+
 macro_rules! impl_try_from {
     (ty: $type:ty, owned_ty: $owned_type:ty, validate_fn: $validate_fn:ident, try_from: [$($from:ty),*],) => {
         $(
@@ -22,4 +31,5 @@ macro_rules! impl_try_from {
     };
 }
 
+pub(crate) use impl_str_basic;
 pub(crate) use impl_try_from;

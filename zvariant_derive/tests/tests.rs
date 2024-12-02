@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 
-use byteorder::LE;
 use std::collections::HashMap;
 use zvariant::{
-    DeserializeDict, EncodingContext, EncodingFormat, OwnedValue, SerializeDict, Type, Value,
+    serialized::{Context, Format},
+    DeserializeDict, OwnedValue, SerializeDict, Type, Value, LE,
 };
 
 #[test]
@@ -11,7 +11,7 @@ fn derive_unit_struct() {
     #[derive(Type)]
     struct FooF(f64);
 
-    assert_eq!(FooF::signature(), "d")
+    assert_eq!(FooF::SIGNATURE, "d")
 }
 
 #[test]
@@ -23,7 +23,7 @@ fn derive_struct() {
         blob: Vec<u8>,
     }
 
-    assert_eq!(TestStruct::signature(), "(syay)")
+    assert_eq!(TestStruct::SIGNATURE, "(syay)")
 }
 
 #[test]
@@ -36,7 +36,7 @@ fn derive_enum() {
         DoNotQueue = 0x04,
     }
 
-    assert_eq!(RequestNameFlags::signature(), "u")
+    assert_eq!(RequestNameFlags::SIGNATURE, "u")
 }
 
 #[test]
@@ -56,21 +56,29 @@ fn derive_dict() {
         field_c: vec![1, 2, 3],
     };
 
-    let ctxt = EncodingContext::<LE>::new(EncodingFormat::DBus, 0);
+    let ctxt = Context::new(Format::DBus, LE, 0);
     let serialized = zvariant::to_bytes(ctxt, &test).unwrap();
-    let deserialized: HashMap<String, OwnedValue> =
-        zvariant::from_slice(&serialized, ctxt).unwrap().0;
+    let deserialized: HashMap<String, OwnedValue> = serialized.deserialize().unwrap().0;
 
-    assert_eq!(deserialized["fieldA"], Value::from(1u32).into());
-    assert_eq!(deserialized["field-b"], Value::from("foo").into());
-    assert_eq!(deserialized["fieldC"], Value::from(&[1u8, 2, 3][..]).into());
+    assert_eq!(
+        deserialized["fieldA"],
+        Value::from(1u32).try_into().unwrap()
+    );
+    assert_eq!(
+        deserialized["field-b"],
+        Value::from("foo").try_into().unwrap()
+    );
+    assert_eq!(
+        deserialized["fieldC"],
+        Value::from(&[1u8, 2, 3][..]).try_into().unwrap()
+    );
 
     let serialized = zvariant::to_bytes(ctxt, &deserialized).unwrap();
-    let deserialized: Test = zvariant::from_slice(&serialized, ctxt).unwrap().0;
+    let deserialized: Test = serialized.deserialize().unwrap().0;
 
     assert_eq!(deserialized.field_a, Some(1u32));
     assert_eq!(deserialized.field_b.as_str(), "foo");
     assert_eq!(deserialized.field_c.as_slice(), &[1u8, 2, 3][..]);
 
-    assert_eq!(Test::signature(), "a{sv}")
+    assert_eq!(Test::SIGNATURE, "a{sv}")
 }

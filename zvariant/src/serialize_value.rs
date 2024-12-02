@@ -1,7 +1,7 @@
 use serde::ser::{Serialize, SerializeStruct, Serializer};
 use static_assertions::assert_impl_all;
 
-use crate::{Signature, Type, Value};
+use crate::Type;
 
 /// A wrapper to serialize `T: Type + Serialize` as a value.
 ///
@@ -9,9 +9,9 @@ use crate::{Signature, Type, Value};
 /// generic [`Value`] and instead use this wrapper.
 ///
 /// ```
-/// # use zvariant::{to_bytes, EncodingContext, SerializeValue};
+/// # use zvariant::{to_bytes, serialized::Context, SerializeValue, LE};
 /// #
-/// # let ctxt = EncodingContext::<byteorder::LE>::new_dbus(0);
+/// # let ctxt = Context::new_dbus(LE, 0);
 /// let _ = to_bytes(ctxt, &SerializeValue(&[0, 1, 2])).unwrap();
 /// ```
 ///
@@ -26,18 +26,15 @@ impl<'a, T: Type + Serialize> Serialize for SerializeValue<'a, T> {
         S: Serializer,
     {
         // Serializer implementation needs to ensure padding isn't added for Value.
-        let mut structure = serializer.serialize_struct("zvariant::Value", 2)?;
+        let mut structure = serializer.serialize_struct("Variant", 2)?;
 
-        let signature = T::signature();
-        structure.serialize_field("zvariant::Value::Signature", &signature)?;
-        structure.serialize_field("zvariant::Value::Value", self.0)?;
+        structure.serialize_field("signature", T::SIGNATURE)?;
+        structure.serialize_field("value", self.0)?;
 
         structure.end()
     }
 }
 
 impl<'a, T: Type + Serialize> Type for SerializeValue<'a, T> {
-    fn signature() -> Signature<'static> {
-        Value::signature()
-    }
+    const SIGNATURE: &'static crate::Signature = &crate::Signature::Variant;
 }

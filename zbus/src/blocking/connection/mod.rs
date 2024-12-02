@@ -21,8 +21,7 @@ pub use builder::Builder;
 /// A blocking wrapper of [`zbus::Connection`].
 ///
 /// Most of the API is very similar to [`zbus::Connection`], except it's blocking.
-#[derive(derivative::Derivative, Clone)]
-#[derivative(Debug)]
+#[derive(Debug, Clone)]
 #[must_use = "Dropping a `Connection` will close the underlying socket."]
 pub struct Connection {
     inner: crate::Connection,
@@ -68,15 +67,10 @@ impl Connection {
 
     /// Send a method call.
     ///
-    /// Create a method-call message, send it over the connection, then wait for the reply. Incoming
-    /// messages are received through [`receive_message`] until the matching method reply (error or
-    /// return) is received.
+    /// Create a method-call message, send it over the connection, then wait for the reply.
     ///
     /// On successful reply, an `Ok(Message)` is returned. On error, an `Err` is returned. D-Bus
-    /// error replies are returned as [`MethodError`].
-    ///
-    /// [`receive_message`]: struct.Connection.html#method.receive_message
-    /// [`MethodError`]: enum.Error.html#variant.MethodError
+    /// error replies are returned as [`Error::MethodError`].
     pub fn call_method<'d, 'p, 'i, 'm, D, P, I, M, B>(
         &self,
         destination: Option<D>,
@@ -134,7 +128,7 @@ impl Connection {
     ///
     /// Given an existing message (likely a method call), send a reply back to the caller with the
     /// given `body`.
-    pub fn reply<B>(&self, call: &Message, body: &B) -> Result<()>
+    pub fn reply<B>(&self, call: &zbus::message::Header<'_>, body: &B) -> Result<()>
     where
         B: serde::ser::Serialize + zvariant::DynamicType,
     {
@@ -147,7 +141,12 @@ impl Connection {
     /// with the given `error_name` and `body`.
     ///
     /// Returns the message serial number.
-    pub fn reply_error<'e, E, B>(&self, call: &Message, error_name: E, body: &B) -> Result<()>
+    pub fn reply_error<'e, E, B>(
+        &self,
+        call: &zbus::message::Header<'_>,
+        error_name: E,
+        body: &B,
+    ) -> Result<()>
     where
         B: serde::ser::Serialize + zvariant::DynamicType,
         E: TryInto<ErrorName<'e>>,
@@ -214,7 +213,7 @@ impl Connection {
         block_on(self.inner.release_name(well_known_name))
     }
 
-    /// Checks if `self` is a connection to a message bus.
+    /// Check if `self` is a connection to a message bus.
     ///
     /// This will return `false` for p2p connections.
     pub fn is_bus(&self) -> bool {
@@ -225,7 +224,16 @@ impl Connection {
     ///
     /// The `ObjectServer` is created on-demand.
     pub fn object_server(&self) -> impl Deref<Target = ObjectServer> + '_ {
-        self.inner.sync_object_server(true, None)
+        struct Wrapper(ObjectServer);
+        impl Deref for Wrapper {
+            type Target = ObjectServer;
+
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+
+        Wrapper(ObjectServer::new(&self.inner))
     }
 
     /// Get a reference to the underlying async Connection.
@@ -238,14 +246,14 @@ impl Connection {
         self.inner
     }
 
-    /// Returns a listener, notified on various connection activity.
+    /// Return a listener, notified on various connection activity.
     ///
     /// This function is meant for the caller to implement idle or timeout on inactivity.
     pub fn monitor_activity(&self) -> EventListener {
         self.inner.monitor_activity()
     }
 
-    /// Returns the peer credentials.
+    /// Return the peer credentials.
     ///
     /// The fields are populated on the best effort basis. Some or all fields may not even make
     /// sense for certain sockets or on certain platforms and hence will be set to `None`.
@@ -263,6 +271,14 @@ impl Connection {
     pub fn close(self) -> Result<()> {
         block_on(self.inner.close())
     }
+
+    /// Gracefully close the connection, waiting for all other references to be dropped.
+    ///
+    /// Blocking version of [`crate::Connection::graceful_shutdown`]. See docs there for
+    /// more details and caveats.
+    pub fn graceful_shutdown(self) {
+        block_on(self.inner.graceful_shutdown())
+    }
 }
 
 impl From<crate::Connection> for Connection {
@@ -271,8 +287,10 @@ impl From<crate::Connection> for Connection {
     }
 }
 
+#[cfg(feature = "p2p")]
 #[cfg(all(test, unix))]
 mod tests {
+    use event_listener::Listener;
     use ntest::timeout;
     #[cfg(all(unix, not(feature = "tokio")))]
     use std::os::unix::net::UnixStream;
@@ -299,7 +317,8 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let server_thread = thread::spawn(move || {
             let c = Builder::unix_stream(p0)
-                .server(&guid)
+                .server(guid)
+                .unwrap()
                 .p2p()
                 .build()
                 .unwrap();
@@ -308,17 +327,19 @@ mod tests {
                 .call_method(None::<()>, "/", Some("org.zbus.p2p"), "Test", &())
                 .unwrap();
             assert_eq!(reply.to_string(), "Method return");
-            let val: String = reply.body().unwrap();
+            let val: String = reply.body().deserialize().unwrap();
             val
         });
 
         let c = Builder::unix_stream(p1).p2p().build().unwrap();
+
         let listener = c.monitor_activity();
+
         let mut s = MessageIterator::from(&c);
         tx.send(()).unwrap();
         let m = s.next().unwrap().unwrap();
         assert_eq!(m.to_string(), "Method call Test");
-        c.reply(&m, &("yay")).unwrap();
+        c.reply(&m.header(), &("yay")).unwrap();
 
         for _ in s {}
 
@@ -330,7 +351,10 @@ mod tests {
         // eventually, nothing happens and it will timeout
         loop {
             let listener = c.monitor_activity();
-            if !listener.wait_timeout(std::time::Duration::from_millis(10)) {
+            if listener
+                .wait_timeout(std::time::Duration::from_millis(10))
+                .is_none()
+            {
                 break;
             }
         }

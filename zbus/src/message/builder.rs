@@ -2,93 +2,46 @@ use std::{
     io::{Cursor, Write},
     sync::Arc,
 };
-
 #[cfg(unix)]
-use crate::message::Fds;
-#[cfg(unix)]
-use std::os::unix::io::RawFd;
+use zvariant::OwnedFd;
 
 use enumflags2::BitFlags;
 use zbus_names::{BusName, ErrorName, InterfaceName, MemberName, UniqueName};
+use zvariant::{serialized, Endian, Signature};
 
 use crate::{
-    message::{Field, FieldCode, Fields, Flags, Header, Message, PrimaryHeader, Sequence, Type},
+    message::{EndianSig, Fields, Flags, Header, Message, PrimaryHeader, Sequence, Type},
     utils::padding_for_8_bytes,
-    zvariant::{DynamicType, EncodingContext, ObjectPath, Signature},
+    zvariant::{serialized::Context, DynamicType, ObjectPath},
     Error, Result,
 };
 
-use crate::message::{fields::QuickFields, header::MAX_MESSAGE_SIZE};
+use crate::message::header::MAX_MESSAGE_SIZE;
 
 #[cfg(unix)]
-type BuildGenericResult = Vec<RawFd>;
+type BuildGenericResult = Vec<OwnedFd>;
 
 #[cfg(not(unix))]
 type BuildGenericResult = ();
 
 macro_rules! dbus_context {
-    ($n_bytes_before: expr) => {
-        EncodingContext::<byteorder::NativeEndian>::new_dbus($n_bytes_before)
+    ($self:ident, $n_bytes_before: expr) => {
+        Context::new_dbus($self.header.primary().endian_sig().into(), $n_bytes_before)
     };
 }
 
-/// A builder for [`Message`]
+/// A builder for a [`Message`].
 #[derive(Debug, Clone)]
 pub struct Builder<'a> {
     header: Header<'a>,
 }
 
 impl<'a> Builder<'a> {
-    fn new(msg_type: Type) -> Self {
+    pub(super) fn new(msg_type: Type) -> Self {
         let primary = PrimaryHeader::new(msg_type, 0);
         let fields = Fields::new();
         let header = Header::new(primary, fields);
         Self { header }
-    }
-
-    /// Create a message of type [`Type::MethodCall`].
-    #[deprecated(since = "4.0.0", note = "Please use `Message::method` instead")]
-    pub fn method_call<'p: 'a, 'm: 'a, P, M>(path: P, method_name: M) -> Result<Self>
-    where
-        P: TryInto<ObjectPath<'p>>,
-        M: TryInto<MemberName<'m>>,
-        P::Error: Into<Error>,
-        M::Error: Into<Error>,
-    {
-        Self::new(Type::MethodCall).path(path)?.member(method_name)
-    }
-
-    /// Create a message of type [`Type::Signal`].
-    #[deprecated(since = "4.0.0", note = "Please use `Message::signal` instead")]
-    pub fn signal<'p: 'a, 'i: 'a, 'm: 'a, P, I, M>(path: P, interface: I, name: M) -> Result<Self>
-    where
-        P: TryInto<ObjectPath<'p>>,
-        I: TryInto<InterfaceName<'i>>,
-        M: TryInto<MemberName<'m>>,
-        P::Error: Into<Error>,
-        I::Error: Into<Error>,
-        M::Error: Into<Error>,
-    {
-        Self::new(Type::Signal)
-            .path(path)?
-            .interface(interface)?
-            .member(name)
-    }
-
-    /// Create a message of type [`Type::MethodReturn`].
-    #[deprecated(since = "4.0.0", note = "Please use `Message::method_reply` instead")]
-    pub fn method_return(reply_to: &Header<'_>) -> Result<Self> {
-        Self::new(Type::MethodReturn).reply_to(reply_to)
-    }
-
-    /// Create a message of type [`Type::Error`].
-    #[deprecated(since = "4.0.0", note = "Please use `Message::method_error` instead")]
-    pub fn error<'e: 'a, E>(reply_to: &Header<'_>, name: E) -> Result<Self>
-    where
-        E: TryInto<ErrorName<'e>>,
-        E::Error: Into<Error>,
-    {
-        Self::new(Type::Error).error_name(name)?.reply_to(reply_to)
     }
 
     /// Add flags to the message.
@@ -113,9 +66,7 @@ impl<'a> Builder<'a> {
         S: TryInto<UniqueName<'s>>,
         S::Error: Into<Error>,
     {
-        self.header
-            .fields_mut()
-            .replace(Field::Sender(sender.try_into().map_err(Into::into)?));
+        self.header.fields_mut().sender = Some(sender.try_into().map_err(Into::into)?);
         Ok(self)
     }
 
@@ -125,9 +76,7 @@ impl<'a> Builder<'a> {
         P: TryInto<ObjectPath<'p>>,
         P::Error: Into<Error>,
     {
-        self.header
-            .fields_mut()
-            .replace(Field::Path(path.try_into().map_err(Into::into)?));
+        self.header.fields_mut().path = Some(path.try_into().map_err(Into::into)?);
         Ok(self)
     }
 
@@ -137,9 +86,7 @@ impl<'a> Builder<'a> {
         I: TryInto<InterfaceName<'i>>,
         I::Error: Into<Error>,
     {
-        self.header
-            .fields_mut()
-            .replace(Field::Interface(interface.try_into().map_err(Into::into)?));
+        self.header.fields_mut().interface = Some(interface.try_into().map_err(Into::into)?);
         Ok(self)
     }
 
@@ -149,20 +96,16 @@ impl<'a> Builder<'a> {
         M: TryInto<MemberName<'m>>,
         M::Error: Into<Error>,
     {
-        self.header
-            .fields_mut()
-            .replace(Field::Member(member.try_into().map_err(Into::into)?));
+        self.header.fields_mut().member = Some(member.try_into().map_err(Into::into)?);
         Ok(self)
     }
 
-    fn error_name<'e: 'a, E>(mut self, error: E) -> Result<Self>
+    pub(super) fn error_name<'e: 'a, E>(mut self, error: E) -> Result<Self>
     where
         E: TryInto<ErrorName<'e>>,
         E::Error: Into<Error>,
     {
-        self.header
-            .fields_mut()
-            .replace(Field::ErrorName(error.try_into().map_err(Into::into)?));
+        self.header.fields_mut().error_name = Some(error.try_into().map_err(Into::into)?);
         Ok(self)
     }
 
@@ -172,21 +115,30 @@ impl<'a> Builder<'a> {
         D: TryInto<BusName<'d>>,
         D::Error: Into<Error>,
     {
-        self.header.fields_mut().replace(Field::Destination(
-            destination.try_into().map_err(Into::into)?,
-        ));
+        self.header.fields_mut().destination = Some(destination.try_into().map_err(Into::into)?);
         Ok(self)
     }
 
-    fn reply_to(mut self, reply_to: &Header<'_>) -> Result<Self> {
+    pub(super) fn reply_to(mut self, reply_to: &Header<'_>) -> Result<Self> {
         let serial = reply_to.primary().serial_num();
-        self.header.fields_mut().replace(Field::ReplySerial(serial));
+        self.header.fields_mut().reply_serial = Some(serial);
+        self = self.endian(reply_to.primary().endian_sig().into());
 
         if let Some(sender) = reply_to.sender() {
             self.destination(sender.to_owned())
         } else {
             Ok(self)
         }
+    }
+
+    /// Set the endianness of the message.
+    ///
+    /// The default endianness is native.
+    pub fn endian(mut self, endian: Endian) -> Self {
+        let sig = EndianSig::from(endian);
+        self.header.primary_mut().set_endian_sig(sig);
+
+        self
     }
 
     /// Build the [`Message`] with the given body.
@@ -203,35 +155,29 @@ impl<'a> Builder<'a> {
     where
         B: serde::ser::Serialize + DynamicType,
     {
-        let ctxt = dbus_context!(0);
+        let ctxt = dbus_context!(self, 0);
 
         // Note: this iterates the body twice, but we prefer efficient handling of large messages
         // to efficient handling of ones that are complex to serialize.
-        #[cfg(unix)]
-        let (body_len, fds_len) = zvariant::serialized_size_fds(ctxt, body)?;
-        #[cfg(not(unix))]
-        let body_len = zvariant::serialized_size(ctxt, body)?;
+        let body_size = zvariant::serialized_size(ctxt, body)?;
 
-        let signature = body.dynamic_signature();
+        let signature = body.signature();
 
-        self.build_generic(
-            signature,
-            body_len,
-            move |cursor| {
-                #[cfg(unix)]
-                {
-                    let (_, fds) = zvariant::to_writer_fds(cursor, ctxt, body)?;
-                    Ok::<Vec<RawFd>, Error>(fds)
-                }
-                #[cfg(not(unix))]
-                {
-                    zvariant::to_writer(cursor, ctxt, body)?;
-                    Ok::<(), Error>(())
-                }
-            },
-            #[cfg(unix)]
-            fds_len,
-        )
+        self.build_generic(signature, body_size, move |cursor| {
+            // SAFETY: build_generic puts FDs and the body in the same Message.
+            unsafe { zvariant::to_writer(cursor, ctxt, body) }
+                .map(|s| {
+                    #[cfg(unix)]
+                    {
+                        s.into_fds()
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = s;
+                    }
+                })
+                .map_err(Into::into)
+        })
     }
 
     /// Create a new message from a raw slice of bytes to populate the body with, rather than by
@@ -240,102 +186,95 @@ impl<'a> Builder<'a> {
     /// # Safety
     ///
     /// This method is unsafe because it can be used to build an invalid message.
-    pub unsafe fn build_raw_body<'b, S>(
+    pub unsafe fn build_raw_body<S>(
         self,
         body_bytes: &[u8],
         signature: S,
-        #[cfg(unix)] fds: Vec<RawFd>,
+        #[cfg(unix)] fds: Vec<OwnedFd>,
     ) -> Result<Message>
     where
-        S: TryInto<Signature<'b>>,
+        S: TryInto<Signature>,
         S::Error: Into<Error>,
     {
-        let signature: Signature<'b> = signature.try_into().map_err(Into::into)?;
+        let signature = signature.try_into().map_err(Into::into)?;
+        let body_size = serialized::Size::new(body_bytes.len(), dbus_context!(self, 0));
         #[cfg(unix)]
-        let fds_len = fds.len();
+        let body_size = {
+            let num_fds = fds.len().try_into().map_err(|_| Error::ExcessData)?;
+            body_size.set_num_fds(num_fds)
+        };
 
         self.build_generic(
             signature,
-            body_bytes.len(),
+            body_size,
             move |cursor: &mut Cursor<&mut Vec<u8>>| {
                 cursor.write_all(body_bytes)?;
 
                 #[cfg(unix)]
-                return Ok::<Vec<RawFd>, Error>(fds);
+                return Ok::<Vec<OwnedFd>, Error>(fds);
 
                 #[cfg(not(unix))]
                 return Ok::<(), Error>(());
             },
-            #[cfg(unix)]
-            fds_len,
         )
     }
 
     fn build_generic<WriteFunc>(
         self,
-        mut signature: Signature<'_>,
-        body_len: usize,
+        signature: Signature,
+        body_size: serialized::Size,
         write_body: WriteFunc,
-        #[cfg(unix)] fds_len: usize,
     ) -> Result<Message>
     where
         WriteFunc: FnOnce(&mut Cursor<&mut Vec<u8>>) -> Result<BuildGenericResult>,
     {
-        let ctxt = dbus_context!(0);
+        let ctxt = dbus_context!(self, 0);
         let mut header = self.header;
 
-        if !signature.is_empty() {
-            if signature.starts_with(zvariant::STRUCT_SIG_START_STR) {
-                // Remove leading and trailing STRUCT delimiters
-                signature = signature.slice(1..signature.len() - 1);
-            }
-            header.fields_mut().add(Field::Signature(signature));
-        }
+        header.fields_mut().signature = std::borrow::Cow::Owned(signature);
 
-        let body_len_u32 = body_len.try_into().map_err(|_| Error::ExcessData)?;
+        let body_len_u32 = body_size.size().try_into().map_err(|_| Error::ExcessData)?;
         header.primary_mut().set_body_len(body_len_u32);
 
         #[cfg(unix)]
         {
-            let fds_len_u32 = fds_len.try_into().map_err(|_| Error::ExcessData)?;
+            let fds_len = body_size.num_fds();
             if fds_len != 0 {
-                header.fields_mut().add(Field::UnixFDs(fds_len_u32));
+                header.fields_mut().unix_fds = Some(fds_len);
             }
         }
 
-        let hdr_len = zvariant::serialized_size(ctxt, &header)?;
+        let hdr_len = *zvariant::serialized_size(ctxt, &header)?;
         // We need to align the body to 8-byte boundary.
         let body_padding = padding_for_8_bytes(hdr_len);
         let body_offset = hdr_len + body_padding;
-        let total_len = body_offset + body_len;
+        let total_len = body_offset + body_size.size();
         if total_len > MAX_MESSAGE_SIZE {
             return Err(Error::ExcessData);
         }
         let mut bytes: Vec<u8> = Vec::with_capacity(total_len);
         let mut cursor = Cursor::new(&mut bytes);
 
-        zvariant::to_writer(&mut cursor, ctxt, &header)?;
-        for _ in 0..body_padding {
-            cursor.write_all(&[0u8])?;
-        }
+        // SAFETY: There are no FDs involved.
+        unsafe { zvariant::to_writer(&mut cursor, ctxt, &header) }?;
+        cursor.write_all(&[0u8; 8][..body_padding])?;
         #[cfg(unix)]
-        let fds = write_body(&mut cursor)?;
+        let fds: Vec<_> = write_body(&mut cursor)?.into_iter().collect();
         #[cfg(not(unix))]
         write_body(&mut cursor)?;
 
         let primary_header = header.into_primary();
-        let (header, actual_hdr_len): (Header<'_>, _) = zvariant::from_slice(&bytes, ctxt)?;
-        assert_eq!(hdr_len, actual_hdr_len);
-        let quick_fields = QuickFields::new(&bytes, &header)?;
+        #[cfg(unix)]
+        let bytes = serialized::Data::new_fds(bytes, ctxt, fds);
+        #[cfg(not(unix))]
+        let bytes = serialized::Data::new(bytes, ctxt);
 
         Ok(Message {
             inner: Arc::new(super::Inner {
                 primary_header,
-                quick_fields,
+                quick_fields: std::sync::OnceLock::new(),
                 bytes,
                 body_offset,
-                #[cfg(unix)]
-                fds: Fds::Raw(fds),
                 recv_seq: Sequence::default(),
             }),
         })
@@ -346,8 +285,8 @@ impl<'m> From<Header<'m>> for Builder<'m> {
     fn from(mut header: Header<'m>) -> Self {
         // Signature and Fds are added by body* methods.
         let fields = header.fields_mut();
-        fields.remove(FieldCode::Signature);
-        fields.remove(FieldCode::UnixFDs);
+        fields.signature = std::borrow::Cow::Owned(Signature::Unit);
+        fields.unix_fds = None;
 
         Self { header }
     }
@@ -372,7 +311,7 @@ mod tests {
             )?
         };
 
-        let output: Vec<i32> = message.body()?;
+        let output: Vec<i32> = message.body().deserialize()?;
         assert_eq!(output, vec![1, 2, 3, 4]);
 
         Ok(())

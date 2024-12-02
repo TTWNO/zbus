@@ -1,47 +1,38 @@
 use serde::de::{self, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, Visitor};
-use static_assertions::assert_impl_all;
 
 use std::{ffi::CStr, marker::PhantomData, str};
 
 #[cfg(unix)]
-use std::os::unix::io::RawFd;
+use std::os::fd::AsFd;
 
 use crate::{
-    de::ValueParseStage, framing_offset_size::FramingOffsetSize, framing_offsets::FramingOffsets,
-    signature_parser::SignatureParser, utils::*, Basic, EncodingContext, EncodingFormat, Error,
-    Result, Signature,
+    de::{DeserializerCommon, ValueParseStage},
+    framing_offset_size::FramingOffsetSize,
+    framing_offsets::FramingOffsets,
+    serialized::{Context, Format},
+    utils::*,
+    Basic, Error, ObjectPath, Result, Signature,
 };
 
 /// Our GVariant deserialization implementation.
 #[derive(Debug)]
-pub struct Deserializer<'de, 'sig, 'f, B>(pub(crate) crate::DeserializerCommon<'de, 'sig, 'f, B>);
+pub(crate) struct Deserializer<'de, 'sig, 'f, F>(pub(crate) DeserializerCommon<'de, 'sig, 'f, F>);
 
-assert_impl_all!(Deserializer<'_, '_,'_, i32>: Send, Sync, Unpin);
-
-impl<'de, 'sig, 'f, B> Deserializer<'de, 'sig, 'f, B>
-where
-    B: byteorder::ByteOrder,
-{
+impl<'de, 'sig, 'f, F> Deserializer<'de, 'sig, 'f, F> {
     /// Create a Deserializer struct instance.
     ///
     /// On Windows, the function doesn't have `fds` argument.
-    pub fn new<'r: 'de, S>(
+    pub fn new<'r: 'de>(
         bytes: &'r [u8],
-        #[cfg(unix)] fds: Option<&'f [RawFd]>,
-        signature: S,
-        ctxt: EncodingContext<B>,
-    ) -> Result<Self>
-    where
-        S: TryInto<Signature<'sig>>,
-        S::Error: Into<Error>,
-    {
-        assert_eq!(ctxt.format(), EncodingFormat::GVariant);
+        #[cfg(unix)] fds: Option<&'f [F]>,
+        signature: &'sig Signature,
+        ctxt: Context,
+    ) -> Result<Self> {
+        assert_eq!(ctxt.format(), Format::GVariant);
 
-        let signature = signature.try_into().map_err(Into::into)?;
-        let sig_parser = SignatureParser::new(signature);
-        Ok(Self(crate::DeserializerCommon {
+        Ok(Self(DeserializerCommon {
             ctxt,
-            sig_parser,
+            signature,
             bytes,
             #[cfg(unix)]
             fds,
@@ -49,7 +40,6 @@ where
             fds: PhantomData,
             pos: 0,
             container_depths: Default::default(),
-            b: PhantomData,
         }))
     }
 }
@@ -60,20 +50,19 @@ macro_rules! deserialize_basic {
         where
             V: Visitor<'de>,
         {
-            let ctxt = EncodingContext::new_dbus(self.0.ctxt.position() + self.0.pos);
+            let ctxt = Context::new_dbus(self.0.ctxt.endian(), self.0.ctxt.position() + self.0.pos);
 
-            let mut dbus_de = crate::dbus::Deserializer::<B>(crate::DeserializerCommon::<B> {
+            let mut dbus_de = crate::dbus::Deserializer::<F>(DeserializerCommon::<F> {
                 ctxt,
-                sig_parser: self.0.sig_parser.clone(),
+                signature: self.0.signature,
                 bytes: subslice(self.0.bytes, self.0.pos..)?,
                 fds: self.0.fds,
                 pos: 0,
                 container_depths: self.0.container_depths,
-                b: PhantomData,
             });
 
             let v = dbus_de.$method(visitor)?;
-            self.0.sig_parser = dbus_de.0.sig_parser;
+            self.0.signature = dbus_de.0.signature;
             self.0.pos += dbus_de.0.pos;
             // Basic types don't have anything to do with container depths so not updating it here.
 
@@ -97,9 +86,8 @@ macro_rules! deserialize_as {
     }
 }
 
-impl<'de, 'd, 'sig, 'f, B> de::Deserializer<'de> for &'d mut Deserializer<'de, 'sig, 'f, B>
-where
-    B: byteorder::ByteOrder,
+impl<'de, 'd, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F> de::Deserializer<'de>
+    for &'d mut Deserializer<'de, 'sig, 'f, F>
 {
     type Error = Error;
 
@@ -107,9 +95,7 @@ where
     where
         V: Visitor<'de>,
     {
-        let c = self.0.sig_parser.next_char()?;
-
-        crate::de::deserialize_any::<Self, V>(self, c, visitor)
+        crate::de::deserialize_any::<Self, V>(self, &self.0.signature, visitor)
     }
 
     deserialize_basic!(deserialize_bool);
@@ -154,82 +140,88 @@ where
         V: Visitor<'de>,
     {
         let slice = subslice(self.0.bytes, self.0.pos..)?;
-        let s = if self.0.sig_parser.next_char()? == VARIANT_SIGNATURE_CHAR {
-            if slice.contains(&0) {
-                return Err(serde::de::Error::invalid_value(
-                    serde::de::Unexpected::Char('\0'),
-                    &"GVariant string type must not contain interior null bytes",
-                ));
+
+        let s = match self.0.signature {
+            Signature::Variant => {
+                if slice.contains(&0) {
+                    return Err(serde::de::Error::invalid_value(
+                        serde::de::Unexpected::Char('\0'),
+                        &"GVariant string type must not contain interior null bytes",
+                    ));
+                }
+
+                // GVariant decided to skip the trailing nul at the end of signature string
+                str::from_utf8(slice).map_err(Error::Utf8)?
             }
+            Signature::Str | Signature::Signature | Signature::ObjectPath => {
+                let cstr = CStr::from_bytes_with_nul(slice).map_err(|_| -> Error {
+                    let unexpected = if self.0.bytes.is_empty() {
+                        de::Unexpected::Other("end of byte stream")
+                    } else {
+                        let c = self.0.bytes[self.0.bytes.len() - 1] as char;
+                        de::Unexpected::Char(c)
+                    };
 
-            // GVariant decided to skip the trailing nul at the end of signature string
-            str::from_utf8(slice).map_err(Error::Utf8)?
-        } else {
-            let cstr = CStr::from_bytes_with_nul(slice).map_err(|_| -> Error {
-                let unexpected = if self.0.bytes.is_empty() {
-                    de::Unexpected::Other("end of byte stream")
-                } else {
-                    let c = self.0.bytes[self.0.bytes.len() - 1] as char;
-                    de::Unexpected::Char(c)
-                };
+                    de::Error::invalid_value(unexpected, &"nul byte expected at the end of strings")
+                })?;
+                let s = cstr.to_str().map_err(Error::Utf8)?;
+                self.0.pos += s.len() + 1; // string and trailing null byte
 
-                de::Error::invalid_value(unexpected, &"nul byte expected at the end of strings")
-            })?;
-            let s = cstr.to_str().map_err(Error::Utf8)?;
-            self.0.pos += s.len() + 1; // string and trailing null byte
-
-            s
+                s
+            }
+            _ => {
+                let expected = format!(
+                    "`{}`, `{}`, `{}` or `{}`",
+                    <&str>::SIGNATURE_STR,
+                    Signature::SIGNATURE_STR,
+                    ObjectPath::SIGNATURE_STR,
+                    VARIANT_SIGNATURE_CHAR,
+                );
+                return Err(Error::SignatureMismatch(self.0.signature.clone(), expected));
+            }
         };
-        self.0.sig_parser.skip_char()?;
-
         visitor.visit_borrowed_str(s)
     }
 
-    #[cfg(feature = "option-as-array")]
-    fn deserialize_option<V>(self, _visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        panic!("`option-as-array` and `gvariant` features are incompatible. Don't enable both.");
-    }
-
-    #[cfg(not(feature = "option-as-array"))]
     fn deserialize_option<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        let signature = self.0.sig_parser.next_signature()?;
-        let alignment = alignment_for_signature(&signature, self.0.ctxt.format())?;
-        let child_sig_parser = self.0.sig_parser.slice(1..);
-        let child_signature = child_sig_parser.next_signature()?;
-        let child_sig_len = child_signature.len();
-        let fixed_sized_child = crate::utils::is_fixed_sized_signature(&child_signature)?;
-
-        self.0.sig_parser.skip_char()?;
+        let alignment = self.0.signature.alignment(self.0.ctxt.format());
         self.0.parse_padding(alignment)?;
 
-        if self.0.pos == self.0.bytes.len() {
-            // Empty sequence means None
-            self.0.sig_parser.skip_chars(child_sig_len)?;
+        let child_signature = match self.0.signature {
+            Signature::Maybe(child) => child.signature(),
+            _ => {
+                return Err(Error::SignatureMismatch(
+                    self.0.signature.clone(),
+                    "a maybe".to_string(),
+                ));
+            }
+        };
+        let fixed_sized_child = child_signature.is_fixed_sized();
 
+        if self.0.pos == self.0.bytes.len() {
             visitor.visit_none()
         } else {
-            let ctxt =
-                EncodingContext::new(self.0.ctxt.format(), self.0.ctxt.position() + self.0.pos);
+            let ctxt = Context::new(
+                self.0.ctxt.format(),
+                self.0.ctxt.endian(),
+                self.0.ctxt.position() + self.0.pos,
+            );
             let end = if fixed_sized_child {
                 self.0.bytes.len()
             } else {
                 self.0.bytes.len() - 1
             };
 
-            let mut de = Deserializer::<B>(crate::DeserializerCommon {
+            let mut de = Deserializer::<F>(DeserializerCommon {
                 ctxt,
-                sig_parser: self.0.sig_parser.clone(),
+                signature: child_signature,
                 bytes: subslice(self.0.bytes, self.0.pos..end)?,
                 fds: self.0.fds,
                 pos: 0,
                 container_depths: self.0.container_depths.inc_maybe()?,
-                b: PhantomData,
             });
 
             let v = visitor.visit_some(&mut de)?;
@@ -247,7 +239,6 @@ where
 
                 self.0.pos += 1;
             }
-            self.0.sig_parser = de.0.sig_parser;
 
             Ok(v)
         }
@@ -288,48 +279,22 @@ where
     where
         V: Visitor<'de>,
     {
-        match self.0.sig_parser.next_char()? {
-            VARIANT_SIGNATURE_CHAR => {
-                self.0.sig_parser.skip_char()?;
-                self.0.parse_padding(VARIANT_ALIGNMENT_GVARIANT)?;
+        let alignment = self.0.signature.alignment(Format::GVariant);
+        self.0.parse_padding(alignment)?;
+
+        match self.0.signature {
+            Signature::Variant => {
                 let value_de = ValueDeserializer::new(self)?;
 
                 visitor.visit_seq(value_de)
             }
-            ARRAY_SIGNATURE_CHAR => {
-                self.0.sig_parser.skip_char()?;
-                let next_signature_char = self.0.sig_parser.next_char()?;
+            Signature::Array(_) => {
                 let array_de = ArrayDeserializer::new(self)?;
-
-                if next_signature_char == DICT_ENTRY_SIG_START_CHAR {
-                    visitor.visit_map(array_de)
-                } else {
-                    visitor.visit_seq(array_de)
-                }
+                visitor.visit_seq(array_de)
             }
-            STRUCT_SIG_START_CHAR => {
-                let signature = self.0.sig_parser.next_signature()?;
-                let alignment = alignment_for_signature(&signature, self.0.ctxt.format())?;
-                self.0.parse_padding(alignment)?;
-
-                self.0.sig_parser.skip_char()?;
-
-                let start = self.0.pos;
-                let end = self.0.bytes.len();
-                let offset_size = FramingOffsetSize::for_encoded_container(end - start);
-                self.0.container_depths = self.0.container_depths.inc_structure()?;
-                let v = visitor.visit_seq(StructureDeserializer {
-                    de: self,
-                    start,
-                    end,
-                    offsets_len: 0,
-                    offset_size,
-                });
-                self.0.container_depths = self.0.container_depths.dec_structure();
-
-                v
-            }
-            <u8 as Basic>::SIGNATURE_CHAR => {
+            Signature::Dict { .. } => visitor.visit_map(ArrayDeserializer::new(self)?),
+            Signature::Structure(_) => visitor.visit_seq(StructureDeserializer::new(self)?),
+            Signature::U8 => {
                 // Empty struct: encoded as a `0u8`.
                 let _: u8 = serde::Deserialize::deserialize(&mut *self)?;
 
@@ -339,16 +304,15 @@ where
                     de: self,
                     start,
                     end,
+                    field_idx: 0,
+                    num_fields: 0,
                     offsets_len: 0,
                     offset_size: FramingOffsetSize::U8,
                 })
             }
-            c => Err(de::Error::invalid_type(
-                de::Unexpected::Char(c),
-                &format!(
-                    "`{VARIANT_SIGNATURE_CHAR}`, `{ARRAY_SIGNATURE_CHAR}` or `{STRUCT_SIG_START_CHAR}`",
-                )
-                .as_str(),
+            _ => Err(Error::SignatureMismatch(
+                self.0.signature.clone(),
+                "a variant, array, dict, structure or u8".to_string(),
             )),
         }
     }
@@ -362,29 +326,14 @@ where
     where
         V: Visitor<'de>,
     {
-        let signature = self.0.sig_parser.next_signature()?;
-        let alignment = alignment_for_signature(&signature, self.0.ctxt.format())?;
+        let alignment = self.0.signature.alignment(self.0.ctxt.format());
         self.0.parse_padding(alignment)?;
-
-        let non_unit = if self.0.sig_parser.next_char()? == STRUCT_SIG_START_CHAR {
-            // This means we've a non-unit enum. Let's skip the `(`.
-            self.0.sig_parser.skip_char()?;
-
-            true
-        } else {
-            false
-        };
 
         let v = visitor.visit_enum(crate::de::Enum {
             de: &mut *self,
             name,
-            phantom: PhantomData,
+            _phantom: PhantomData,
         })?;
-
-        if non_unit {
-            // For non-unit enum, we need to skip the closing paren.
-            self.0.sig_parser.skip_char()?;
-        }
 
         Ok(v)
     }
@@ -394,28 +343,29 @@ where
     }
 }
 
-fn deserialize_ay<'de, B>(de: &mut Deserializer<'de, '_, '_, B>) -> Result<&'de [u8]>
-where
-    B: byteorder::ByteOrder,
-{
-    if de.0.sig_parser.next_signature()? != "ay" {
+fn deserialize_ay<'de, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F>(
+    de: &mut Deserializer<'de, '_, '_, F>,
+) -> Result<&'de [u8]> {
+    if !matches!(de.0.signature, Signature::Array(child) if child.signature() == &Signature::U8) {
         return Err(de::Error::invalid_type(de::Unexpected::Seq, &"ay"));
     }
 
-    de.0.sig_parser.skip_char()?;
     let ad = ArrayDeserializer::new(de)?;
-    let len = dbg!(ad.len);
+    let len = ad.len;
+    de.0.container_depths = de.0.container_depths.dec_array();
+
     de.0.next_slice(len)
 }
 
-struct ArrayDeserializer<'d, 'de, 'sig, 'f, B> {
-    de: &'d mut Deserializer<'de, 'sig, 'f, B>,
+struct ArrayDeserializer<'d, 'de, 'sig, 'f, F> {
+    de: &'d mut Deserializer<'de, 'sig, 'f, F>,
     len: usize,
     start: usize,
     // alignment of element
     element_alignment: usize,
-    // where value signature starts
-    element_signature_len: usize,
+    // Element signature in case of normal array, key signature in case of dict.
+    child_signature: &'sig Signature,
+    value_signature: Option<&'sig Signature>,
     // All offsets (GVariant-specific)
     offsets: Option<FramingOffsets>,
     // Length of all the offsets after the array
@@ -424,32 +374,31 @@ struct ArrayDeserializer<'d, 'de, 'sig, 'f, B> {
     key_offset_size: Option<FramingOffsetSize>,
 }
 
-impl<'d, 'de, 'sig, 'f, B> ArrayDeserializer<'d, 'de, 'sig, 'f, B>
-where
-    B: byteorder::ByteOrder,
+impl<'d, 'de, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F>
+    ArrayDeserializer<'d, 'de, 'sig, 'f, F>
 {
-    fn new(de: &'d mut Deserializer<'de, 'sig, 'f, B>) -> Result<Self> {
+    fn new(de: &'d mut Deserializer<'de, 'sig, 'f, F>) -> Result<Self> {
         de.0.container_depths = de.0.container_depths.inc_array()?;
+        let alignment = de.0.signature.alignment(Format::GVariant);
+        de.0.parse_padding(alignment)?;
         let mut len = de.0.bytes.len() - de.0.pos;
 
-        let element_signature = de.0.sig_parser.next_signature()?;
-        let element_alignment = alignment_for_signature(&element_signature, de.0.ctxt.format())?;
-        let element_signature_len = element_signature.len();
-        let fixed_sized_child = crate::utils::is_fixed_sized_signature(&element_signature)?;
-        let fixed_sized_key = if de.0.sig_parser.next_char()? == DICT_ENTRY_SIG_START_CHAR {
-            // Key signature can only be 1 char
-            let key_signature = Signature::from_str_unchecked(&element_signature[1..2]);
-
-            crate::utils::is_fixed_sized_signature(&key_signature)?
-        } else {
-            false
-        };
-
-        // D-Bus requires padding for the first element even when there is no first element
-        // (i-e empty array) so we parse padding already. In case of GVariant this is just
-        // the padding of the array itself since array starts with first element.
-        let padding = de.0.parse_padding(element_alignment)?;
-        len -= padding;
+        let (child_signature, value_signature, fixed_sized_key, fixed_sized_child) =
+            match de.0.signature {
+                Signature::Array(child) => (child.signature(), None, false, child.is_fixed_sized()),
+                Signature::Dict { key, value } => (
+                    key.signature(),
+                    Some(value.signature()),
+                    key.is_fixed_sized(),
+                    key.is_fixed_sized() && value.is_fixed_sized(),
+                ),
+                _ => {
+                    return Err(Error::SignatureMismatch(
+                        de.0.signature.clone(),
+                        "an array or dict".to_string(),
+                    ));
+                }
+            };
 
         let (offsets, offsets_len, key_offset_size) = if !fixed_sized_child {
             let (array_offsets, offsets_len) =
@@ -470,16 +419,13 @@ where
         };
         let start = de.0.pos;
 
-        if de.0.sig_parser.next_char()? == DICT_ENTRY_SIG_START_CHAR {
-            de.0.sig_parser.skip_char()?;
-        }
-
         Ok(Self {
             de,
             len,
             start,
-            element_alignment,
-            element_signature_len,
+            element_alignment: alignment,
+            child_signature,
+            value_signature,
             offsets,
             offsets_len,
             key_offset_size,
@@ -489,7 +435,7 @@ where
     fn element_end(&mut self, pop: bool) -> Result<usize> {
         match self.offsets.as_mut() {
             Some(offsets) => {
-                assert_eq!(self.de.0.ctxt.format(), EncodingFormat::GVariant);
+                assert_eq!(self.de.0.ctxt.format(), Format::GVariant);
 
                 let offset = if pop { offsets.pop() } else { offsets.peek() };
                 match offset {
@@ -510,9 +456,8 @@ where
     }
 }
 
-impl<'d, 'de, 'sig, 'f, B> SeqAccess<'de> for ArrayDeserializer<'d, 'de, 'sig, 'f, B>
-where
-    B: byteorder::ByteOrder,
+impl<'d, 'de, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F> SeqAccess<'de>
+    for ArrayDeserializer<'d, 'de, 'sig, 'f, F>
 {
     type Error = Error;
 
@@ -521,30 +466,26 @@ where
         T: DeserializeSeed<'de>,
     {
         if self.done() {
-            self.de
-                .0
-                .sig_parser
-                .skip_chars(self.element_signature_len)?;
             self.de.0.pos += self.offsets_len;
             self.de.0.container_depths = self.de.0.container_depths.dec_array();
 
             return Ok(None);
         }
 
-        let ctxt = EncodingContext::new(
+        let ctxt = Context::new(
             self.de.0.ctxt.format(),
+            self.de.0.ctxt.endian(),
             self.de.0.ctxt.position() + self.de.0.pos,
         );
         let end = self.element_end(true)?;
 
-        let mut de = Deserializer::<B>(crate::DeserializerCommon {
+        let mut de = Deserializer::<F>(DeserializerCommon {
             ctxt,
-            sig_parser: self.de.0.sig_parser.clone(),
+            signature: &self.child_signature,
             bytes: subslice(self.de.0.bytes, self.de.0.pos..end)?,
             fds: self.de.0.fds,
             pos: 0,
             container_depths: self.de.0.container_depths,
-            b: PhantomData,
         });
 
         let v = seed.deserialize(&mut de).map(Some);
@@ -562,9 +503,8 @@ where
     }
 }
 
-impl<'d, 'de, 'sig, 'f, B> MapAccess<'de> for ArrayDeserializer<'d, 'de, 'sig, 'f, B>
-where
-    B: byteorder::ByteOrder,
+impl<'d, 'de, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F> MapAccess<'de>
+    for ArrayDeserializer<'d, 'de, 'sig, 'f, F>
 {
     type Error = Error;
 
@@ -573,26 +513,29 @@ where
         K: DeserializeSeed<'de>,
     {
         if self.done() {
-            // Starting bracket was already skipped
-            self.de
-                .0
-                .sig_parser
-                .skip_chars(self.element_signature_len - 1)?;
             self.de.0.pos += self.offsets_len;
+            self.de.0.container_depths = self.de.0.container_depths.dec_array();
 
             return Ok(None);
         }
 
         self.de.0.parse_padding(self.element_alignment)?;
 
-        let ctxt = EncodingContext::new(
+        let ctxt = Context::new(
             self.de.0.ctxt.format(),
+            self.de.0.ctxt.endian(),
             self.de.0.ctxt.position() + self.de.0.pos,
         );
         let element_end = self.element_end(false)?;
 
         let key_end = match self.key_offset_size {
             Some(_) => {
+                if self.de.0.pos > element_end {
+                    return Err(serde::de::Error::invalid_length(
+                        self.de.0.pos,
+                        &format!("< {}", element_end).as_str(),
+                    ));
+                }
                 let offset_size =
                     FramingOffsetSize::for_encoded_container(element_end - self.de.0.pos);
                 self.key_offset_size.replace(offset_size);
@@ -604,14 +547,13 @@ where
             None => element_end,
         };
 
-        let mut de = Deserializer::<B>(crate::DeserializerCommon {
+        let mut de = Deserializer::<F>(DeserializerCommon {
             ctxt,
-            sig_parser: self.de.0.sig_parser.clone(),
+            signature: &self.child_signature,
             bytes: subslice(self.de.0.bytes, self.de.0.pos..key_end)?,
             fds: self.de.0.fds,
             pos: 0,
             container_depths: self.de.0.container_depths,
-            b: PhantomData,
         });
         let v = seed.deserialize(&mut de).map(Some);
         self.de.0.pos += de.0.pos;
@@ -631,27 +573,32 @@ where
     where
         V: DeserializeSeed<'de>,
     {
-        let ctxt = EncodingContext::new(
+        let ctxt = Context::new(
             self.de.0.ctxt.format(),
+            self.de.0.ctxt.endian(),
             self.de.0.ctxt.position() + self.de.0.pos,
         );
         let element_end = self.element_end(true)?;
         let value_end = match self.key_offset_size {
-            Some(key_offset_size) => element_end - key_offset_size as usize,
+            Some(key_offset_size) => {
+                if key_offset_size as usize > element_end {
+                    return Err(serde::de::Error::invalid_length(
+                        key_offset_size as usize,
+                        &format!("< {}", element_end).as_str(),
+                    ));
+                }
+                element_end - key_offset_size as usize
+            }
             None => element_end,
         };
-        let mut sig_parser = self.de.0.sig_parser.clone();
-        // Skip key signature (always 1 char)
-        sig_parser.skip_char()?;
 
-        let mut de = Deserializer::<B>(crate::DeserializerCommon {
+        let mut de = Deserializer::<F>(DeserializerCommon {
             ctxt,
-            sig_parser,
+            signature: self.value_signature.as_ref().unwrap(),
             bytes: subslice(self.de.0.bytes, self.de.0.pos..value_end)?,
             fds: self.de.0.fds,
             pos: 0,
             container_depths: self.de.0.container_depths,
-            b: PhantomData,
         });
         let v = seed.deserialize(&mut de);
         self.de.0.pos += de.0.pos;
@@ -673,19 +620,50 @@ where
 }
 
 #[derive(Debug)]
-struct StructureDeserializer<'d, 'de, 'sig, 'f, B> {
-    de: &'d mut Deserializer<'de, 'sig, 'f, B>,
+struct StructureDeserializer<'d, 'de, 'sig, 'f, F> {
+    de: &'d mut Deserializer<'de, 'sig, 'f, F>,
     start: usize,
     end: usize,
+    /// Index of the next field to serialize.
+    field_idx: usize,
+    /// The number of fields in the structure.
+    num_fields: usize,
     // Length of all the offsets after the array
     offsets_len: usize,
     // size of the framing offset
     offset_size: FramingOffsetSize,
 }
 
-impl<'d, 'de, 'sig, 'f, B> SeqAccess<'de> for StructureDeserializer<'d, 'de, 'sig, 'f, B>
-where
-    B: byteorder::ByteOrder,
+impl<'d, 'de, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F>
+    StructureDeserializer<'d, 'de, 'sig, 'f, F>
+{
+    fn new(de: &'d mut Deserializer<'de, 'sig, 'f, F>) -> Result<Self> {
+        let num_fields = match de.0.signature {
+            Signature::Structure(fields) => fields.iter().count(),
+            _ => unreachable!("Incorrect signature for struct"),
+        };
+        let alignment = de.0.signature.alignment(Format::GVariant);
+        de.0.parse_padding(alignment)?;
+        de.0.container_depths = de.0.container_depths.inc_structure()?;
+
+        let start = de.0.pos;
+        let end = de.0.bytes.len();
+        let offset_size = FramingOffsetSize::for_encoded_container(end - start);
+
+        Ok(Self {
+            de,
+            start,
+            end,
+            field_idx: 0,
+            num_fields,
+            offsets_len: 0,
+            offset_size,
+        })
+    }
+}
+
+impl<'d, 'de, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F> SeqAccess<'de>
+    for StructureDeserializer<'d, 'de, 'sig, 'f, F>
 {
     type Error = Error;
 
@@ -693,16 +671,29 @@ where
     where
         T: DeserializeSeed<'de>,
     {
-        let ctxt = EncodingContext::new(
+        if self.field_idx == self.num_fields {
+            return Ok(None);
+        }
+
+        let ctxt = Context::new(
             self.de.0.ctxt.format(),
+            self.de.0.ctxt.endian(),
             self.de.0.ctxt.position() + self.de.0.pos,
         );
-        let element_signature = self.de.0.sig_parser.next_signature()?;
-        let fixed_sized_element = crate::utils::is_fixed_sized_signature(&element_signature)?;
-        let element_end = if !fixed_sized_element {
-            let next_sig_pos = element_signature.len();
-            let parser = self.de.0.sig_parser.slice(next_sig_pos..);
-            if !parser.done() && parser.next_char()? == STRUCT_SIG_END_CHAR {
+        let signature = self.de.0.signature;
+        let field_signature = match signature {
+            Signature::Structure(fields) => {
+                let signature = fields.iter().nth(self.field_idx).ok_or_else(|| {
+                    Error::SignatureMismatch(signature.clone(), "a struct".to_string())
+                })?;
+                self.field_idx += 1;
+
+                signature
+            }
+            _ => unreachable!("Incorrect signature for struct"),
+        };
+        let element_end = if !field_signature.is_fixed_sized() {
+            if self.field_idx == self.num_fields {
                 // This is the last item then and in GVariant format, we don't have offset for it
                 // even if it's non-fixed-sized.
                 self.end
@@ -728,37 +719,33 @@ where
             self.end
         };
 
-        let sig_parser = self.de.0.sig_parser.clone();
-        let mut de = Deserializer::<B>(crate::DeserializerCommon {
+        let mut de = Deserializer::<F>(DeserializerCommon {
             ctxt,
-            sig_parser,
+            signature: field_signature,
             bytes: subslice(self.de.0.bytes, self.de.0.pos..element_end)?,
             fds: self.de.0.fds,
             pos: 0,
             container_depths: self.de.0.container_depths,
-            b: PhantomData,
         });
         let v = seed.deserialize(&mut de).map(Some);
         self.de.0.pos += de.0.pos;
         // No need for retaking the container depths as the field can't be incomplete.
 
-        if de.0.sig_parser.next_char()? == STRUCT_SIG_END_CHAR {
-            // Last item in the struct
-            de.0.sig_parser.skip_char()?;
+        if self.field_idx == self.num_fields {
+            // All fields have been deserialized.
+            self.de.0.container_depths = self.de.0.container_depths.dec_structure();
 
             // Skip over the framing offsets (if any)
             self.de.0.pos += self.offsets_len;
         }
-
-        self.de.0.sig_parser = de.0.sig_parser;
 
         v
     }
 }
 
 #[derive(Debug)]
-struct ValueDeserializer<'d, 'de, 'sig, 'f, B> {
-    de: &'d mut Deserializer<'de, 'sig, 'f, B>,
+struct ValueDeserializer<'d, 'de, 'sig, 'f, F> {
+    de: &'d mut Deserializer<'de, 'sig, 'f, F>,
     stage: ValueParseStage,
     sig_start: usize,
     sig_end: usize,
@@ -766,11 +753,12 @@ struct ValueDeserializer<'d, 'de, 'sig, 'f, B> {
     value_end: usize,
 }
 
-impl<'d, 'de, 'sig, 'f, B> ValueDeserializer<'d, 'de, 'sig, 'f, B>
-where
-    B: byteorder::ByteOrder,
+impl<'d, 'de, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F>
+    ValueDeserializer<'d, 'de, 'sig, 'f, F>
 {
-    fn new(de: &'d mut Deserializer<'de, 'sig, 'f, B>) -> Result<Self> {
+    fn new(de: &'d mut Deserializer<'de, 'sig, 'f, F>) -> Result<Self> {
+        de.0.parse_padding(VARIANT_ALIGNMENT_GVARIANT)?;
+
         // GVariant format has signature at the end
         let mut separator_pos = None;
 
@@ -800,7 +788,7 @@ where
             Some(separator_pos) => (separator_pos + 1, de.0.bytes.len(), de.0.pos, separator_pos),
         };
 
-        Ok(ValueDeserializer::<B> {
+        Ok(ValueDeserializer::<F> {
             de,
             stage: ValueParseStage::Signature,
             sig_start,
@@ -811,9 +799,8 @@ where
     }
 }
 
-impl<'d, 'de, 'sig, 'f, B> SeqAccess<'de> for ValueDeserializer<'d, 'de, 'sig, 'f, B>
-where
-    B: byteorder::ByteOrder,
+impl<'d, 'de, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F> SeqAccess<'de>
+    for ValueDeserializer<'d, 'de, 'sig, 'f, F>
 {
     type Error = Error;
 
@@ -825,18 +812,14 @@ where
             ValueParseStage::Signature => {
                 self.stage = ValueParseStage::Value;
 
-                let signature = Signature::from_static_str_unchecked(VARIANT_SIGNATURE_STR);
-                let sig_parser = SignatureParser::new(signature);
-
-                let mut de = Deserializer::<B>(crate::DeserializerCommon {
+                let mut de = Deserializer::<F>(DeserializerCommon {
                     // No padding in signatures so just pass the same context
                     ctxt: self.de.0.ctxt,
-                    sig_parser,
+                    signature: &Signature::Variant,
                     bytes: subslice(self.de.0.bytes, self.sig_start..self.sig_end)?,
                     fds: self.de.0.fds,
                     pos: 0,
                     container_depths: self.de.0.container_depths,
-                    b: PhantomData,
                 });
 
                 seed.deserialize(&mut de).map(Some)
@@ -845,22 +828,20 @@ where
                 self.stage = ValueParseStage::Done;
 
                 let slice = subslice(self.de.0.bytes, self.sig_start..self.sig_end)?;
-                // FIXME: Can we just use `Signature::from_bytes_unchecked`?
-                let signature = Signature::try_from(slice)?;
-                let sig_parser = SignatureParser::new(signature);
+                let signature = Signature::from_bytes(slice)?;
 
-                let ctxt = EncodingContext::new(
+                let ctxt = Context::new(
                     self.de.0.ctxt.format(),
+                    self.de.0.ctxt.endian(),
                     self.de.0.ctxt.position() + self.value_start,
                 );
-                let mut de = Deserializer::<B>(crate::DeserializerCommon {
+                let mut de = Deserializer::<F>(DeserializerCommon {
                     ctxt,
-                    sig_parser,
+                    signature: &signature,
                     bytes: subslice(self.de.0.bytes, self.value_start..self.value_end)?,
                     fds: self.de.0.fds,
                     pos: 0,
                     container_depths: self.de.0.container_depths.inc_variant()?,
-                    b: PhantomData,
                 });
 
                 let v = seed.deserialize(&mut de).map(Some);
@@ -874,23 +855,8 @@ where
     }
 }
 
-impl<'de, 'd, 'sig, 'f, B> crate::de::GetDeserializeCommon<'de, 'sig, 'f, B>
-    for &'d mut Deserializer<'de, 'sig, 'f, B>
-where
-    B: byteorder::ByteOrder,
-{
-    fn common_mut<'dr>(self) -> &'dr mut crate::de::DeserializerCommon<'de, 'sig, 'f, B>
-    where
-        Self: 'dr,
-    {
-        &mut self.0
-    }
-}
-
-impl<'de, 'd, 'sig, 'f, B> EnumAccess<'de>
-    for crate::de::Enum<B, &'d mut Deserializer<'de, 'sig, 'f, B>>
-where
-    B: byteorder::ByteOrder,
+impl<'de, 'd, 'sig, 'f, #[cfg(unix)] F: AsFd, #[cfg(not(unix))] F> EnumAccess<'de>
+    for crate::de::Enum<&'d mut Deserializer<'de, 'sig, 'f, F>, F>
 {
     type Error = Error;
     type Variant = Self;

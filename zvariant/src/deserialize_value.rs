@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use serde::de::{Deserialize, Deserializer, SeqAccess, Visitor};
 use static_assertions::assert_impl_all;
 
-use crate::{Signature, Type, Value};
+use crate::{Signature, Type};
 
 /// A wrapper to deserialize a value to `T: Type + Deserialize`.
 ///
@@ -12,13 +12,13 @@ use crate::{Signature, Type, Value};
 /// generic [`Value`] and instead use this wrapper.
 ///
 /// ```
-/// # use zvariant::{to_bytes, EncodingContext, DeserializeValue, SerializeValue, from_slice};
+/// # use zvariant::{to_bytes, serialized::Context, DeserializeValue, SerializeValue, LE};
 /// #
-/// # let ctxt = EncodingContext::<byteorder::LE>::new_dbus(0);
+/// # let ctxt = Context::new_dbus(LE, 0);
 /// # let array = [0, 1, 2];
 /// # let v = SerializeValue(&array);
 /// # let encoded = to_bytes(ctxt, &v).unwrap();
-/// let decoded: DeserializeValue<[u8; 3]> = from_slice(&encoded, ctxt).unwrap().0;
+/// let decoded: DeserializeValue<[u8; 3]> = encoded.deserialize().unwrap().0;
 /// # assert_eq!(decoded.0, array);
 /// ```
 ///
@@ -35,10 +35,10 @@ impl<'de, T: Type + Deserialize<'de>> Deserialize<'de> for DeserializeValue<'de,
     where
         D: Deserializer<'de>,
     {
-        const FIELDS: &[&str] = &["zvariant::Value::Signature", "zvariant::Value::Value"];
+        const FIELDS: &[&str] = &["signature", "value"];
         Ok(DeserializeValue(
             deserializer.deserialize_struct(
-                "zvariant::Value",
+                "Variant",
                 FIELDS,
                 DeserializeValueVisitor(PhantomData),
             )?,
@@ -53,19 +53,19 @@ impl<'de, T: Type + Deserialize<'de>> Visitor<'de> for DeserializeValueVisitor<T
     type Value = T;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("zvariant::Value")
+        formatter.write_str("Variant")
     }
 
     fn visit_seq<V>(self, mut seq: V) -> Result<Self::Value, V::Error>
     where
         V: SeqAccess<'de>,
     {
-        let sig: Signature<'_> = seq
+        let sig: Signature = seq
             .next_element()?
             .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
-        if sig != T::signature() {
+        if T::SIGNATURE != &sig {
             return Err(serde::de::Error::invalid_value(
-                serde::de::Unexpected::Str(&sig),
+                serde::de::Unexpected::Str(&sig.to_string()),
                 &"the value signature",
             ));
         }
@@ -76,7 +76,5 @@ impl<'de, T: Type + Deserialize<'de>> Visitor<'de> for DeserializeValueVisitor<T
 }
 
 impl<'de, T: Type + Deserialize<'de>> Type for DeserializeValue<'de, T> {
-    fn signature() -> Signature<'static> {
-        Value::signature()
-    }
+    const SIGNATURE: &'static Signature = &Signature::Variant;
 }

@@ -4,7 +4,7 @@ use zvariant::ObjectPath;
 
 use crate::{blocking::Connection, proxy::CacheProperties, utils::block_on, Error, Result};
 
-pub use crate::proxy::ProxyDefault;
+pub use crate::proxy::Defaults;
 
 /// Builder for proxies.
 #[derive(Debug, Clone)]
@@ -67,21 +67,11 @@ impl<'a, T> Builder<'a, T> {
 
 impl<'a, T> Builder<'a, T>
 where
-    T: ProxyDefault,
+    T: Defaults,
 {
     /// Create a new [`Builder`] for the given connection.
     #[must_use]
     pub fn new(conn: &Connection) -> Self {
         Self(crate::proxy::Builder::new(&conn.clone().into()))
-    }
-
-    /// Create a new [`Builder`] for the given connection.
-    #[must_use]
-    #[deprecated(
-        since = "4.0.0",
-        note = "use `Builder::new` instead, which is now generic over the proxy type"
-    )]
-    pub fn new_bare(conn: &Connection) -> Self {
-        Self::new(conn)
     }
 }

@@ -4,15 +4,15 @@ use enumflags2::{bitflags, BitFlags};
 use event_listener::{Event, EventListener};
 use futures_core::{ready, stream};
 use futures_util::{future::Either, stream::Map};
-use once_cell::sync::OnceCell;
 use ordered_stream::{join as join_streams, FromFuture, Join, OrderedStream, PollResult};
 use static_assertions::assert_impl_all;
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     future::Future,
     ops::Deref,
     pin::Pin,
-    sync::{Arc, RwLock, RwLockReadGuard},
+    sync::{Arc, OnceLock, RwLock, RwLockReadGuard},
     task::{Context, Poll},
 };
 use tracing::{debug, info_span, instrument, trace, Instrument};
@@ -27,7 +27,10 @@ use crate::{
 };
 
 mod builder;
-pub use builder::{Builder, CacheProperties, ProxyDefault};
+pub use builder::{Builder, CacheProperties};
+
+mod defaults;
+pub use defaults::Defaults;
 
 /// A client-side interface proxy.
 ///
@@ -52,7 +55,8 @@ pub use builder::{Builder, CacheProperties, ProxyDefault};
 ///     // owned return value
 ///     let _id: String = p.call("GetId", &()).await?;
 ///     // borrowed return value
-///     let _id: &str = p.call_method("GetId", &()).await?.body()?;
+///     let body = p.call_method("GetId", &()).await?.body();
+///     let _id: &str = body.deserialize()?;
 ///
 ///     Ok(())
 /// }
@@ -60,11 +64,11 @@ pub use builder::{Builder, CacheProperties, ProxyDefault};
 ///
 /// # Note
 ///
-/// It is recommended to use the [`dbus_proxy`] macro, which provides a more convenient and
+/// It is recommended to use the [`proxy`] macro, which provides a more convenient and
 /// type-safe *façade* `Proxy` derived from a Rust trait.
 ///
 /// [`futures` crate]: https://crates.io/crates/futures
-/// [`dbus_proxy`]: attr.dbus_proxy.html
+/// [`proxy`]: attr.proxy.html
 #[derive(Clone, Debug)]
 pub struct Proxy<'a> {
     pub(crate) inner: Arc<ProxyInner<'a>>,
@@ -74,12 +78,20 @@ assert_impl_all!(Proxy<'_>: Send, Sync, Unpin);
 
 /// This is required to avoid having the Drop impl extend the lifetime 'a, which breaks zbus_xmlgen
 /// (and possibly other crates).
-#[derive(derivative::Derivative)]
-#[derivative(Debug)]
 pub(crate) struct ProxyInnerStatic {
-    #[derivative(Debug = "ignore")]
     pub(crate) conn: Connection,
-    dest_owner_change_match_rule: OnceCell<OwnedMatchRule>,
+    dest_owner_change_match_rule: OnceLock<OwnedMatchRule>,
+}
+
+impl fmt::Debug for ProxyInnerStatic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxyInnerStatic")
+            .field(
+                "dest_owner_change_match_rule",
+                &self.dest_owner_change_match_rule,
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -90,7 +102,7 @@ pub(crate) struct ProxyInner<'a> {
     pub(crate) interface: InterfaceName<'a>,
 
     /// Cache of property values.
-    property_cache: Option<OnceCell<(Arc<PropertiesCache>, Task<()>)>>,
+    property_cache: Option<OnceLock<(Arc<PropertiesCache>, Task<()>)>>,
     /// Set of properties which do not get cached, by name.
     /// This overrides proxy-level caching behavior.
     uncached_properties: HashSet<Str<'a>>,
@@ -115,16 +127,16 @@ pub struct PropertyChanged<'a, T> {
 }
 
 impl<'a, T> PropertyChanged<'a, T> {
-    // The name of the property that changed.
+    /// The name of the property that changed.
     pub fn name(&self) -> &str {
         self.name
     }
 
-    // Get the raw value of the property that changed.
-    //
-    // If the notification signal contained the new value, it has been cached already and this call
-    // will return that value. Otherwise (i-e invalidated property), a D-Bus call is made to fetch
-    // and cache the new value.
+    /// Get the raw value of the property that changed.
+    ///
+    /// If the notification signal contained the new value, it has been cached already and this call
+    /// will return that value. Otherwise (i.e. invalidated property), a D-Bus call is made to fetch
+    /// and cache the new value.
     pub async fn get_raw<'p>(&'p self) -> Result<impl Deref<Target = Value<'static>> + 'p> {
         struct Wrapper<'w> {
             name: &'w str,
@@ -188,23 +200,22 @@ where
     T: TryFrom<zvariant::OwnedValue>,
     T::Error: Into<crate::Error>,
 {
-    // Get the value of the property that changed.
-    //
-    // If the notification signal contained the new value, it has been cached already and this call
-    // will return that value. Otherwise (i-e invalidated property), a D-Bus call is made to fetch
-    // and cache the new value.
+    /// Get the value of the property that changed.
+    ///
+    /// If the notification signal contained the new value, it has been cached already and this call
+    /// will return that value. Otherwise (i.e. invalidated property), a D-Bus call is made to fetch
+    /// and cache the new value.
     pub async fn get(&self) -> Result<T> {
         self.get_raw()
             .await
-            .and_then(|v| T::try_from(OwnedValue::from(&*v)).map_err(Into::into))
+            .and_then(|v| T::try_from(OwnedValue::try_from(&*v)?).map_err(Into::into))
     }
 }
 
 /// A [`stream::Stream`] implementation that yields property change notifications.
 ///
 /// Use [`Proxy::receive_property_changed`] to create an instance of this type.
-#[derive(derivative::Derivative)]
-#[derivative(Debug)]
+#[derive(Debug)]
 pub struct PropertyStream<'a, T> {
     name: &'a str,
     proxy: Proxy<'a>,
@@ -315,14 +326,14 @@ impl PropertiesCache {
         (cache, task)
     }
 
-    // new() runs this in a task it spawns for initialization of properties cache.
+    /// new() runs this in a task it spawns for initialization of properties cache.
     async fn init(
         &self,
         proxy: PropertiesProxy<'static>,
         interface: InterfaceName<'static>,
         uncached_properties: HashSet<zvariant::Str<'static>>,
     ) -> Result<(
-        PropertiesChangedStream<'static>,
+        PropertiesChangedStream,
         InterfaceName<'static>,
         HashSet<zvariant::Str<'static>>,
     )> {
@@ -331,11 +342,12 @@ impl PropertiesCache {
         let prop_changes = proxy.receive_properties_changed().await?.map(Either::Left);
 
         let get_all = proxy
+            .inner()
             .connection()
             .call_method_raw(
-                Some(proxy.destination()),
-                proxy.path(),
-                Some(proxy.interface()),
+                Some(proxy.inner().destination()),
+                proxy.inner().path(),
+                Some(proxy.inner().interface()),
                 "GetAll",
                 BitFlags::empty(),
                 &interface,
@@ -351,8 +363,8 @@ impl PropertiesCache {
                     // discard updates prior to the initial population
                 }
                 Some(Either::Right(populate)) => {
-                    populate?.body().map(|values| {
-                        self.update_cache(&uncached_properties, &values, Vec::new(), &interface);
+                    populate?.body().deserialize().map(|values| {
+                        self.update_cache(&uncached_properties, &values, &[], &interface);
                     })?;
                     break;
                 }
@@ -367,7 +379,7 @@ impl PropertiesCache {
                     self.update_cache(
                         &uncached_properties,
                         &args.changed_properties,
-                        args.invalidated_properties,
+                        &args.invalidated_properties,
                         &interface,
                     );
                 }
@@ -381,11 +393,11 @@ impl PropertiesCache {
         Ok((prop_changes, interface, uncached_properties))
     }
 
-    // new() runs this in a task it spawns for keeping the cache in sync.
+    /// new() runs this in a task it spawns for keeping the cache in sync.
     #[instrument(skip_all)]
     async fn keep_updated(
         &self,
-        mut prop_changes: PropertiesChangedStream<'static>,
+        mut prop_changes: PropertiesChangedStream,
         interface: InterfaceName<'static>,
         uncached_properties: HashSet<zvariant::Str<'static>>,
     ) -> Result<()> {
@@ -398,7 +410,7 @@ impl PropertiesCache {
                     self.update_cache(
                         &uncached_properties,
                         &args.changed_properties,
-                        args.invalidated_properties,
+                        &args.invalidated_properties,
                         &interface,
                     );
                 }
@@ -412,13 +424,13 @@ impl PropertiesCache {
         &self,
         uncached_properties: &HashSet<Str<'_>>,
         changed: &HashMap<&str, Value<'_>>,
-        invalidated: Vec<&str>,
+        invalidated: &[&str],
         interface: &InterfaceName<'_>,
     ) {
         let mut values = self.values.write().expect("lock poisoned");
 
         for inval in invalidated {
-            if uncached_properties.contains(&Str::from(inval)) {
+            if uncached_properties.contains(&Str::from(*inval)) {
                 debug!(
                     "Ignoring invalidation of uncached property `{}.{}`",
                     interface, inval
@@ -427,7 +439,7 @@ impl PropertiesCache {
             }
             trace!("Property `{interface}.{inval}` invalidated");
 
-            if let Some(entry) = values.get_mut(inval) {
+            if let Some(entry) = values.get_mut(*inval) {
                 entry.value = None;
                 entry.event.notify(usize::MAX);
             }
@@ -445,12 +457,21 @@ impl PropertiesCache {
 
             let entry = values.entry(property_name.to_string()).or_default();
 
-            entry.value = Some(OwnedValue::from(value));
+            let value = match OwnedValue::try_from(value) {
+                Ok(value) => value,
+                Err(e) => {
+                    debug!(
+                        "Failed to convert property `{interface}.{property_name}` to OwnedValue: {e}"
+                    );
+                    continue;
+                }
+            };
+            entry.value = Some(value);
             entry.event.notify(usize::MAX);
         }
     }
 
-    /// Wait for the cache to be populated and return any error encountered during population
+    /// Wait for the cache to be populated and return any error encountered during population.
     pub(crate) async fn ready(&self) -> Result<()> {
         let listener = match &*self.caching_result.read().expect("lock poisoned") {
             CachingResult::Caching { ready } => ready.listen(),
@@ -478,13 +499,13 @@ impl<'a> ProxyInner<'a> {
         uncached_properties: HashSet<Str<'a>>,
     ) -> Self {
         let property_cache = match cache {
-            CacheProperties::Yes | CacheProperties::Lazily => Some(OnceCell::new()),
+            CacheProperties::Yes | CacheProperties::Lazily => Some(OnceLock::new()),
             CacheProperties::No => None,
         };
         Self {
             inner_without_borrows: ProxyInnerStatic {
                 conn,
-                dest_owner_change_match_rule: OnceCell::new(),
+                dest_owner_change_match_rule: OnceLock::new(),
             },
             destination,
             path,
@@ -606,23 +627,23 @@ impl<'a> Proxy<'a> {
     }
 
     /// Get a reference to the destination service name.
-    pub fn destination(&self) -> &BusName<'_> {
+    pub fn destination(&self) -> &BusName<'a> {
         &self.inner.destination
     }
 
     /// Get a reference to the object path.
-    pub fn path(&self) -> &ObjectPath<'_> {
+    pub fn path(&self) -> &ObjectPath<'a> {
         &self.inner.path
     }
 
     /// Get a reference to the interface.
-    pub fn interface(&self) -> &InterfaceName<'_> {
+    pub fn interface(&self) -> &InterfaceName<'a> {
         &self.inner.interface
     }
 
     /// Introspect the associated object, and return the XML description.
     ///
-    /// See the [xml](xml/index.html) module for parsing the
+    /// See the [xml](https://docs.rs/zbus_xml) crate for parsing the
     /// result.
     pub async fn introspect(&self) -> fdo::Result<String> {
         let proxy = IntrospectableProxy::builder(&self.inner.inner_without_borrows.conn)
@@ -703,9 +724,8 @@ impl<'a> Proxy<'a> {
     {
         self.cached_property_raw(property_name)
             .as_deref()
-            .map(|v| T::try_from(OwnedValue::from(v)))
+            .map(|v| T::try_from(OwnedValue::try_from(v)?).map_err(Into::into))
             .transpose()
-            .map_err(Into::into)
     }
 
     /// Get the cached value of the property `property_name`.
@@ -720,7 +740,7 @@ impl<'a> Proxy<'a> {
             .inner
             .property_cache
             .as_ref()
-            .and_then(OnceCell::get)
+            .and_then(OnceLock::get)
             .map(|c| c.0.values.read().expect("lock poisoned"))
         {
             // ensure that the property is in the cache.
@@ -785,12 +805,12 @@ impl<'a> Proxy<'a> {
     /// Set the property `property_name`.
     ///
     /// Effectively, call the `Set` method of the `org.freedesktop.DBus.Properties` interface.
-    pub async fn set_property<'t, T: 't>(&self, property_name: &str, value: T) -> fdo::Result<()>
+    pub async fn set_property<'t, T>(&self, property_name: &str, value: T) -> fdo::Result<()>
     where
-        T: Into<Value<'t>>,
+        T: 't + Into<Value<'t>>,
     {
         self.properties_proxy()
-            .set(self.inner.interface.as_ref(), property_name, &value.into())
+            .set(self.inner.interface.as_ref(), property_name, value.into())
             .await
     }
 
@@ -830,19 +850,19 @@ impl<'a> Proxy<'a> {
         M: TryInto<MemberName<'m>>,
         M::Error: Into<Error>,
         B: serde::ser::Serialize + zvariant::DynamicType,
-        R: serde::de::DeserializeOwned + zvariant::Type,
+        R: for<'d> zvariant::DynamicDeserialize<'d>,
     {
         let reply = self.call_method(method_name, body).await?;
 
-        reply.body()
+        reply.body().deserialize()
     }
 
     /// Call a method and return the reply body, optionally supplying a set of
     /// method flags to control the way the method call message is sent and handled.
     ///
     /// Use [`call`] instead if you do not need any special handling via additional flags.
-    /// If the `NoReplyExpected` flag is passed , this will return None immediately
-    /// after sending the message, similar to [`call_noreply`]
+    /// If the `NoReplyExpected` flag is passed, this will return None immediately
+    /// after sending the message, similar to [`call_noreply`].
     ///
     /// [`call`]: struct.Proxy.html#method.call
     /// [`call_noreply`]: struct.Proxy.html#method.call_noreply
@@ -856,7 +876,7 @@ impl<'a> Proxy<'a> {
         M: TryInto<MemberName<'m>>,
         M::Error: Into<Error>,
         B: serde::ser::Serialize + zvariant::DynamicType,
-        R: serde::de::DeserializeOwned + zvariant::Type,
+        R: for<'d> zvariant::DynamicDeserialize<'d>,
     {
         let flags = flags.iter().map(Flags::from).collect::<BitFlags<_>>();
         match self
@@ -873,12 +893,12 @@ impl<'a> Proxy<'a> {
             )
             .await?
         {
-            Some(reply) => reply.await?.body().map(Some),
+            Some(reply) => reply.await?.body().deserialize().map(Some),
             None => Ok(None),
         }
     }
 
-    /// Call a method without expecting a reply
+    /// Call a method without expecting a reply.
     ///
     /// This sets the `NoReplyExpected` flag on the calling message and does not wait for a reply.
     pub async fn call_noreply<'m, M, B>(&self, method_name: M, body: &B) -> Result<()>
@@ -892,7 +912,13 @@ impl<'a> Proxy<'a> {
         Ok(())
     }
 
-    /// Create a stream for signal named `signal_name`.
+    /// Create a stream for the signal named `signal_name`.
+    ///
+    /// # Errors
+    ///
+    /// Apart from general I/O errors that can result from socket communications, calling this
+    /// method will also result in an error if the destination service has not yet registered its
+    /// well-known name with the bus (assuming you're using the well-known name as destination).
     pub async fn receive_signal<'m, M>(&self, signal_name: M) -> Result<SignalStream<'m>>
     where
         M: TryInto<MemberName<'m>>,
@@ -908,7 +934,7 @@ impl<'a> Proxy<'a> {
     /// this method where possible. Note that this filtering is limited to arguments of string
     /// types.
     ///
-    /// The arguments are passed as a tuples of argument index and expected value.
+    /// The arguments are passed as tuples of argument index and expected value.
     pub async fn receive_signal_with_args<'m, M>(
         &self,
         signal_name: M,
@@ -977,7 +1003,7 @@ impl<'a> Proxy<'a> {
     ///
     /// Note that zbus doesn't queue the updates. If the listener is slower than the receiver, it
     /// will only receive the last update.
-    pub async fn receive_owner_changed(&self) -> Result<OwnerChangedStream<'_>> {
+    pub async fn receive_owner_changed(&self) -> Result<OwnerChangedStream<'a>> {
         use futures_util::StreamExt;
         let dbus_proxy = fdo::DBusProxy::builder(self.connection())
             .cache_properties(CacheProperties::No)
@@ -1048,8 +1074,8 @@ impl From<MethodFlags> for Flags {
     }
 }
 
-type OwnerChangedStreamMap<'a> = Map<
-    fdo::NameOwnerChangedStream<'a>,
+type OwnerChangedStreamMap = Map<
+    fdo::NameOwnerChangedStream,
     Box<dyn FnMut(fdo::NameOwnerChanged) -> Option<UniqueName<'static>> + Send + Sync + Unpin>,
 >;
 
@@ -1057,15 +1083,15 @@ type OwnerChangedStreamMap<'a> = Map<
 ///
 /// Use [`Proxy::receive_owner_changed`] to create an instance of this type.
 pub struct OwnerChangedStream<'a> {
-    stream: OwnerChangedStreamMap<'a>,
+    stream: OwnerChangedStreamMap,
     name: BusName<'a>,
 }
 
 assert_impl_all!(OwnerChangedStream<'_>: Send, Sync, Unpin);
 
-impl OwnerChangedStream<'_> {
+impl<'a> OwnerChangedStream<'a> {
     /// The bus name being tracked.
-    pub fn name(&self) -> &BusName<'_> {
+    pub fn name(&self) -> &BusName<'a> {
         &self.name
     }
 }
@@ -1176,7 +1202,7 @@ impl<'a> SignalStream<'a> {
                         }
                         Some(Either::Left(Err(_))) => (),
                         Some(Either::Right(Ok(response))) => {
-                            break Some(response.body::<UniqueName<'_>>()?.to_owned())
+                            break Some(response.body().deserialize::<UniqueName<'_>>()?.to_owned())
                         }
                         Some(Either::Right(Err(e))) => {
                             // Probably the name is not owned. Not a problem but let's still log it.
@@ -1308,19 +1334,33 @@ impl AsyncDrop for SignalStream<'_> {
     }
 }
 
+#[cfg(feature = "blocking-api")]
 impl<'a> From<crate::blocking::Proxy<'a>> for Proxy<'a> {
     fn from(proxy: crate::blocking::Proxy<'a>) -> Self {
         proxy.into_inner()
     }
 }
 
+/// This trait is implemented by all async proxies, which are generated with the
+/// [`proxy`](macro@zbus::proxy) macro.
+pub trait ProxyImpl<'c>
+where
+    Self: Sized,
+{
+    /// Return a customizable builder for this proxy.
+    fn builder(conn: &Connection) -> Builder<'c, Self>;
+
+    /// Consume `self`, returning the underlying `zbus::Proxy`.
+    fn into_inner(self) -> Proxy<'c>;
+
+    /// The reference to the underlying `zbus::Proxy`.
+    fn inner(&self) -> &Proxy<'c>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        connection, dbus_interface, dbus_proxy, object_server::SignalContext, utils::block_on,
-        AsyncDrop,
-    };
+    use crate::{connection, interface, object_server::SignalEmitter, proxy, utils::block_on};
     use futures_util::StreamExt;
     use ntest::timeout;
     use test_log::test;
@@ -1349,17 +1389,18 @@ mod tests {
 
         let proxy = fdo::DBusProxy::new(&dest_conn).await?;
         let mut name_acquired_stream = proxy
+            .inner()
             .receive_signal_with_args("NameAcquired", &[(0, well_known)])
             .await?;
 
-        let prop_stream =
-            proxy
-                .receive_property_changed("SomeProp")
-                .await
-                .filter_map(|changed| async move {
-                    let v: Option<u32> = changed.get().await.ok();
-                    dbg!(v)
-                });
+        let prop_stream = proxy
+            .inner()
+            .receive_property_changed("SomeProp")
+            .await
+            .filter_map(|changed| async move {
+                let v: Option<u32> = changed.get().await.ok();
+                dbg!(v)
+            });
         drop(proxy);
         drop(prop_stream);
 
@@ -1371,7 +1412,10 @@ mod tests {
         assert_eq!(&new_owner.unwrap().unwrap(), &*unique_name);
 
         let acquired_signal = acquired_signal.unwrap();
-        assert_eq!(acquired_signal.body::<&str>().unwrap(), well_known);
+        assert_eq!(
+            acquired_signal.body().deserialize::<&str>().unwrap(),
+            well_known
+        );
 
         let proxy = Proxy::new(&conn, &unique_name, "/does/not/matter", "does.not.matter").await?;
         let mut unique_name_changed_stream = proxy.receive_owner_changed().await?;
@@ -1403,23 +1447,23 @@ mod tests {
     /// signal listener is created against another signal. Previously, this second
     /// call to add the match rule never resolved and resulted in a deadlock.
     async fn test_signal_stream_deadlock() -> Result<()> {
-        #[dbus_proxy(
+        #[proxy(
             gen_blocking = false,
             default_path = "/org/zbus/Test",
             default_service = "org.zbus.Test.MR501",
             interface = "org.zbus.Test"
         )]
         trait Test {
-            #[dbus_proxy(signal)]
+            #[zbus(signal)]
             fn my_signal(&self, msg: &str) -> Result<()>;
         }
 
         struct TestIface;
 
-        #[dbus_interface(name = "org.zbus.Test")]
+        #[interface(name = "org.zbus.Test")]
         impl TestIface {
-            #[dbus_interface(signal)]
-            async fn my_signal(context: &SignalContext<'_>, msg: &'static str) -> Result<()>;
+            #[zbus(signal)]
+            async fn my_signal(context: &SignalEmitter<'_>, msg: &'static str) -> Result<()>;
         }
 
         let test_iface = TestIface;
@@ -1461,7 +1505,7 @@ mod tests {
                     .await
                     .unwrap();
 
-                let context = iface_ref.signal_context();
+                let context = iface_ref.signal_emitter();
                 while !tx.is_closed() {
                     for _ in 0..10 {
                         TestIface::my_signal(context, "This is a test")
@@ -1501,20 +1545,4 @@ mod tests {
 
         Ok(())
     }
-}
-
-/// This trait is implemented by all async proxies, which are generated with the
-/// [`dbus_proxy`](zbus::dbus_proxy) macro.
-pub trait ProxyImpl<'c>
-where
-    Self: Sized,
-{
-    /// Returns a customizable builder for this proxy.
-    fn builder(conn: &Connection) -> Builder<'c, Self>;
-
-    /// Consumes `self`, returning the underlying `zbus::Proxy`.
-    fn into_inner(self) -> Proxy<'c>;
-
-    /// The reference to the underlying `zbus::Proxy`.
-    fn inner(&self) -> &Proxy<'c>;
 }

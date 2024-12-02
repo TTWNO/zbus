@@ -1,4 +1,7 @@
-use crate::{utils::impl_try_from, Error, Result};
+use crate::{
+    utils::{impl_str_basic, impl_try_from},
+    Error, Result,
+};
 use serde::{de, Deserialize, Serialize};
 use static_assertions::assert_impl_all;
 use std::{
@@ -36,12 +39,14 @@ use zvariant::{NoneValue, OwnedValue, Str, Type, Value};
 #[derive(
     Clone, Debug, Hash, PartialEq, Eq, Serialize, Type, Value, PartialOrd, Ord, OwnedValue,
 )]
-pub struct WellKnownName<'name>(Str<'name>);
+pub struct WellKnownName<'name>(pub(crate) Str<'name>);
+
+impl_str_basic!(WellKnownName<'_>);
 
 assert_impl_all!(WellKnownName<'_>: Send, Sync, Unpin);
 
 impl<'name> WellKnownName<'name> {
-    /// A borrowed clone (never allocates, unlike clone).
+    /// This is faster than `Clone::clone` when `self` contains owned data.
     pub fn as_ref(&self) -> WellKnownName<'_> {
         WellKnownName(self.0.as_ref())
     }
@@ -61,7 +66,7 @@ impl<'name> WellKnownName<'name> {
 
     /// Same as `try_from`, except it takes a `&'static str`.
     pub fn from_static_str(name: &'static str) -> Result<Self> {
-        ensure_correct_well_known_name(name)?;
+        validate(name)?;
         Ok(Self(Str::from_static(name)))
     }
 
@@ -138,7 +143,22 @@ impl<'de: 'name, 'name> Deserialize<'de> for WellKnownName<'name> {
     }
 }
 
-fn ensure_correct_well_known_name(name: &str) -> Result<()> {
+fn validate(name: &str) -> Result<()> {
+    validate_bytes(name.as_bytes()).map_err(|_| {
+        Error::InvalidName(
+            "Invalid well-known name. \
+            See https://dbus.freedesktop.org/doc/dbus-specification.html#message-protocol-names-bus"
+        )
+    })
+}
+
+pub(crate) fn validate_bytes(bytes: &[u8]) -> std::result::Result<(), ()> {
+    use winnow::{
+        combinator::separated,
+        stream::AsChar,
+        token::{one_of, take_while},
+        Parser,
+    };
     // Rules
     //
     // * Only ASCII alphanumeric, `_` or '-'.
@@ -148,57 +168,22 @@ fn ensure_correct_well_known_name(name: &str) -> Result<()> {
     //  * not begin with a digit.
     //  * be 1 character (so name must be minimum 3 characters long).
     // * <= 255 characters.
-    if name.is_empty() {
-        return Err(Error::InvalidWellKnownName(String::from(
-            "must contain at least 3 characters",
-        )));
-    } else if name.len() < 3 {
-        return Err(Error::InvalidWellKnownName(format!(
-            "`{}` is {} characters long, which is smaller than minimum allowed (3)",
-            name,
-            name.len(),
-        )));
-    } else if name.len() > 255 {
-        return Err(Error::InvalidWellKnownName(format!(
-            "`{}` is {} characters long, which is longer than maximum allowed (255)",
-            name,
-            name.len(),
-        )));
-    }
+    let first_element_char = one_of((AsChar::is_alpha, b'_', b'-'));
+    let subsequent_element_chars = take_while::<_, _, ()>(0.., (AsChar::is_alphanum, b'_', b'-'));
+    let element = (first_element_char, subsequent_element_chars);
+    let mut well_known_name = separated(2.., element, b'.');
 
-    let mut prev = None;
-    let mut no_dot = true;
-    for c in name.chars() {
-        if c == '.' {
-            if prev.is_none() || prev == Some('.') {
-                return Err(Error::InvalidWellKnownName(String::from(
-                    "must not contain a double `.`",
-                )));
+    well_known_name
+        .parse(bytes)
+        .map_err(|_| ())
+        .and_then(|_: ()| {
+            // Least likely scenario so we check this last.
+            if bytes.len() > 255 {
+                return Err(());
             }
 
-            if no_dot {
-                no_dot = false;
-            }
-        } else if c.is_ascii_digit() && (prev.is_none() || prev == Some('.')) {
-            return Err(Error::InvalidWellKnownName(String::from(
-                "each element must not start with a digit",
-            )));
-        } else if !c.is_ascii_alphanumeric() && c != '_' && c != '-' {
-            return Err(Error::InvalidWellKnownName(format!(
-                "`{c}` character not allowed"
-            )));
-        }
-
-        prev = Some(c);
-    }
-
-    if no_dot {
-        return Err(Error::InvalidWellKnownName(String::from(
-            "must contain at least 1 `.`",
-        )));
-    }
-
-    Ok(())
+            Ok(())
+        })
 }
 
 /// This never succeeds but is provided so it's easier to pass `Option::None` values for API
@@ -249,6 +234,8 @@ impl OwnedWellKnownName {
     }
 }
 
+impl_str_basic!(OwnedWellKnownName);
+
 impl Deref for OwnedWellKnownName {
     type Target = WellKnownName<'static>;
 
@@ -283,7 +270,7 @@ impl Display for OwnedWellKnownName {
     }
 }
 
-impl From<OwnedWellKnownName> for WellKnownName<'static> {
+impl From<OwnedWellKnownName> for WellKnownName<'_> {
     fn from(name: OwnedWellKnownName) -> Self {
         name.into_inner()
     }
@@ -304,11 +291,11 @@ impl From<WellKnownName<'_>> for OwnedWellKnownName {
 impl_try_from! {
     ty: WellKnownName<'s>,
     owned_ty: OwnedWellKnownName,
-    validate_fn: ensure_correct_well_known_name,
+    validate_fn: validate,
     try_from: [&'s str, String, Arc<str>, Cow<'s, str>, Str<'s>],
 }
 
-impl From<OwnedWellKnownName> for Str<'static> {
+impl From<OwnedWellKnownName> for Str<'_> {
     fn from(value: OwnedWellKnownName) -> Self {
         value.into_inner().0
     }

@@ -1,5 +1,7 @@
 # FAQ
 
+<!-- toc -->
+
 ## How to use a struct as a dictionary?
 
 Since the use of a dictionary, specifically one with strings as keys and variants as value (i-e
@@ -12,7 +14,7 @@ the `signature` attribute. Here is a simple example:
 
 ```rust,noplayground
 use zbus::{
-    dbus_proxy, dbus_interface, fdo::Result,
+    proxy, interface, fdo::Result,
     zvariant::{DeserializeDict, SerializeDict, Type},
 };
 
@@ -26,7 +28,7 @@ pub struct Dictionary {
     optional_field: Option<String>,
 }
 
-#[dbus_proxy(
+#[proxy(
     interface = "org.zbus.DictionaryGiver",
     default_path = "/org/zbus/DictionaryGiver",
     default_service = "org.zbus.DictionaryGiver",
@@ -37,7 +39,7 @@ trait DictionaryGiver {
 
 struct DictionaryGiverInterface;
 
-#[dbus_interface(interface = "org.zbus.DictionaryGiver")]
+#[interface(interface = "org.zbus.DictionaryGiver")]
 impl DictionaryGiverInterface {
     fn give_me(&self) -> Result<Dictionary> {
         Ok(Dictionary {
@@ -73,7 +75,7 @@ see [the corresponding tokio issue on GitHub][tctiog].
 
 There are typically two reasons this can happen with zbus:
 
-### 1. A `dbus_interface` method that takes a `&mut self` argument is taking too long
+### 1. A `interface` method that takes a `&mut self` argument is taking too long
 
 Simply put, this is because of one of the primary rules of Rust: while a mutable reference to a
 resource exists, no other references to that same resource can exist at the same time. This means
@@ -94,23 +96,21 @@ A common issue might arise when using a zbus proxy is that your proxy's property
 updating. This is due to zbus' default caching policy, which updates the value of a property only
 when a change is signaled, primarily to minimize latency and optimize client request performance.
 By default, if your service does not emit change notifications, the property values will not
-update accordingly. 
+update accordingly.
 
 However, you can disabling caching for specific properties:
 
-- Add the `#[dbus_proxy(property(emits_changed_signal = "false"))]` annotation to the property
-for which you desire to disable caching on.
+- Add the `#[zbus(property(emits_changed_signal = "false"))]` annotation to the property for which
+  you desire to disable caching on. For more information about all the possible values for
+  `emits_changed_signal` refer to [`proxy`] documentation.
 
-- Use `proxy::Builder` to build your proxy instance and use `proxy::Builder::uncached_properties` method
-to list all properties you wish to disable caching for.
+- Use `proxy::Builder` to build your proxy instance and use [`proxy::Builder::uncached_properties`]
+  method to list all properties you wish to disable caching for.
 
-- In order to disable caching for either type of proxy use the `proxy::Builder::cache_properites` 
-method.
+- In order to disable caching for either type of proxy use the [`proxy::Builder::cache_properites`]
+  method.
 
-For more information about all the possible values for `emits_changed_signal` refer
- to [`dbus_proxy`](https://docs.rs/zbus/latest/zbus/attr.dbus_proxy.html) documentation.
-
-## How do I use `Option<T>`` with zbus?
+## How do I use `Option<T>` with zbus?
 
 While `Option<T>` is a very commonly used type in Rust, there is unfortunately [no concept of a
 nullable-type in the D-Bus protocol][nonull]. However, there are two ways to simulate it:
@@ -133,11 +133,12 @@ The idea here is to represent `None` case with 0 elements (empty array) and the 
 element. `zvariant` and `zbus` provide `option-as-array` Cargo feature, which when enabled, allows
 the (de)serialization of `Option<T>`. Unlike the previous solution, this solution can be used with
 all types. However, it does come with some caveats and limitations:
+
   1. Since the D-Bus type signature does not provide any hints about the array being in fact a
     nullable type, this can be confusing for users of generic tools like [`d-feet`]. It is therefore
     highly recommended that service authors document each use of `Option<T>` in their D-Bus
     interface documentation.
-  2. Currently it is not possible to use `Option<T>` for `dbus_interface` and `dbus_proxy` property
+  2. Currently it is not possible to use `Option<T>` for `interface` and `proxy` property
     methods.
   3. Both the sender and receiver must agree on use of this encoding. If the sender sends `T`, the
     receiver will not be able to decode it successfully as `Option<T>` and vice versa.
@@ -149,13 +150,90 @@ enabled.
 
 **Note**: We hope to be able to remove #2 and #4, once [specialization] lands in stable Rust.
 
+## How do enums work?
+
+By default, `zvariant` encodes an unit-type enum as a `u32`, denoting the variant index. Other enums
+are encoded as a structure whose first field is the variant index and the second one are the
+variant's field(s). The only caveat here is that all variants must have the same number and types
+of fields. Names of fields don't matter though. You can make use of [`Value`] or [`OwnedValue`] if you want to encode different data in different fields. Here is a simple example:
+
+```rust,noplayground
+use zbus::zvariant::{serialized::Context, to_bytes, Type, LE};
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize, Serialize, Type, PartialEq, Debug)]
+enum Enum<'s> {
+    Variant1 { field1: u16, field2: i64, field3: &'s str },
+    Variant2(u16, i64, &'s str),
+    Variant3 { f1: u16, f2: i64, f3: &'s str },
+}
+
+let e = Enum::Variant3 {
+    f1: 42,
+    f2: i64::max_value(),
+    f3: "hello",
+};
+let ctxt = Context::new_dbus(LE, 0);
+let encoded = to_bytes(ctxt, &e).unwrap();
+let decoded: Enum = encoded.deserialize().unwrap().0;
+assert_eq!(decoded, e);
+```
+
+Enum encoding can be adjusted by using the [`serde_repr`] crate and by annotating the representation of the enum with `repr`:
+
+```rust,noplayground
+use zbus::zvariant::{serialized::Context, to_bytes, Type, LE};
+use serde_repr::{Serialize_repr, Deserialize_repr};
+
+#[derive(Deserialize_repr, Serialize_repr, Type, PartialEq, Debug)]
+#[repr(u8)]
+enum UnitEnum {
+    Variant1,
+    Variant2,
+    Variant3,
+}
+
+let ctxt = Context::new_dbus(LE, 0);
+let encoded = to_bytes(ctxt, &UnitEnum::Variant2).unwrap();
+let e: UnitEnum = encoded.deserialize().unwrap().0;
+assert_eq!(e, UnitEnum::Variant2);
+```
+
+Unit enums can also be (de)serialized as strings:
+
+```rust,noplayground
+use zbus::zvariant::{serialized::Context, to_bytes, Type, LE};
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize, Serialize, Type, PartialEq, Debug)]
+#[zvariant(signature = "s")]
+enum StrEnum {
+    Variant1,
+    Variant2,
+    Variant3,
+}
+
+let ctxt = Context::new_dbus(LE, 0);
+let encoded = to_bytes(ctxt, &StrEnum::Variant2).unwrap();
+let e: StrEnum = encoded.deserialize().unwrap().0;
+assert_eq!(e, StrEnum::Variant2);
+let s: &str = encoded.deserialize().unwrap().0;
+assert_eq!(s, "Variant2");
+```
+
+[`proxy::Builder::uncached_properties`]: https://docs.rs/zbus/5/zbus/proxy/struct.Builder.html#method.uncached_properties
+[`proxy::Builder::cache_properites`]: https://docs.rs/zbus/5/zbus/proxy/struct.Builder.html#method.cache_properties
+[`proxy`]: https://docs.rs/zbus/5/zbus/attr.proxy.html
 [tctiog]: https://github.com/tokio-rs/tokio/issues/2201
-[`Type`]: https://docs.rs/zvariant/latest/zvariant/derive.Type.html
-[`SerializeDict`]: https://docs.rs/zvariant/latest/zvariant/derive.SerializeDict.html
-[`DeserializeDict`]: https://docs.rs/zvariant/latest/zvariant/derive.DeserializeDict.html
-[`MessageStream`]: https://docs.rs/zbus/latest/zbus/struct.MessageStream.html
+[`Type`]: https://docs.rs/zvariant/5/zvariant/derive.Type.html
+[`SerializeDict`]: https://docs.rs/zvariant/5/zvariant/derive.SerializeDict.html
+[`DeserializeDict`]: https://docs.rs/zvariant/5/zvariant/derive.DeserializeDict.html
+[`MessageStream`]: https://docs.rs/zbus/5/zbus/struct.MessageStream.html
 [nonull]: https://gitlab.freedesktop.org/dbus/dbus/-/issues/25
 [dsi]: http://dbus.freedesktop.org/doc/dbus-specification.html#standard-interfaces
-[`Optional<T>`]: https://docs.rs/zvariant/latest/zvariant/struct.Optional.html
+[`Optional<T>`]: https://docs.rs/zvariant/5/zvariant/struct.Optional.html
 [`d-feet`]: https://wiki.gnome.org/Apps/DFeet
 [specialization]: https://rust-lang.github.io/rfcs/1210-impl-specialization.html
+[`Value`]: https://docs.rs/zvariant/5/zvariant/enum.Value.html
+[`OwnedValue`]: https://docs.rs/zvariant/5/zvariant/struct.OwnedValue.html
+[`serde_repr`]: https://crates.io/crates/serde_repr

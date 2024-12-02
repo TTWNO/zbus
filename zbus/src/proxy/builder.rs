@@ -144,51 +144,21 @@ impl<'a, T> Builder<'a, T> {
 
 impl<'a, T> Builder<'a, T>
 where
-    T: ProxyDefault,
+    T: super::Defaults,
 {
     /// Create a new [`Builder`] for the given connection.
     #[must_use]
     pub fn new(conn: &Connection) -> Self {
         Self {
             conn: conn.clone(),
-            destination: T::DESTINATION
-                .map(|d| BusName::from_static_str(d).expect("invalid bus name")),
-            path: T::PATH.map(|p| ObjectPath::from_static_str(p).expect("invalid default path")),
-            interface: T::INTERFACE
-                .map(|i| InterfaceName::from_static_str(i).expect("invalid interface name")),
+            destination: T::DESTINATION.clone(),
+            path: T::PATH.clone(),
+            interface: T::INTERFACE.clone(),
             cache: CacheProperties::default(),
             uncached_properties: None,
             proxy_type: PhantomData,
         }
     }
-
-    /// Create a new [`Builder`] for the given connection.
-    #[must_use]
-    #[deprecated(
-        since = "4.0.0",
-        note = "use `Builder::new` instead, which is now generic over the proxy type"
-    )]
-    pub fn new_bare(conn: &Connection) -> Self {
-        Self::new(conn)
-    }
-}
-
-/// Trait for the default associated values of a proxy.
-///
-/// The trait is automatically implemented by the [`dbus_proxy`] macro on your behalf, and may be
-/// later used to retrieve the associated constants.
-///
-/// [`dbus_proxy`]: attr.dbus_proxy.html
-pub trait ProxyDefault {
-    const INTERFACE: Option<&'static str>;
-    const DESTINATION: Option<&'static str>;
-    const PATH: Option<&'static str>;
-}
-
-impl ProxyDefault for Proxy<'_> {
-    const INTERFACE: Option<&'static str> = None;
-    const DESTINATION: Option<&'static str> = None;
-    const PATH: Option<&'static str> = None;
 }
 
 #[cfg(test)]
