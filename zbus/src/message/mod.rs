@@ -162,6 +162,26 @@ impl Message {
         &self.inner.primary_header
     }
 
+    pub fn member(&self) -> Option<MemberName<'_>> {
+        self.quick_fields().member(self)
+    }
+    
+    pub fn interface(&self) -> Option<InterfaceName<'_>> {
+        self.quick_fields().interface(self)
+    }
+
+    pub fn sender(&self) -> Option<crate::names::UniqueName<'_>> {
+        self.quick_fields().sender(self)
+    }
+
+    pub fn path(&self) -> Option<ObjectPath<'_>> {
+        self.quick_fields().path(self)
+    }
+
+    pub fn signature(&self) -> &zvariant::Signature {
+        self.quick_fields().signature()
+    }
+
     /// The message header.
     pub fn header(&self) -> Header<'_> {
         let quick_fields = self.quick_fields();

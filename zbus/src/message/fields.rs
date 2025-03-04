@@ -9,6 +9,15 @@ use zvariant::{ObjectPath, Signature, Type, Value};
 
 use crate::message::{FieldCode, Header, Message};
 
+trait FromStrUnchecked<'a> {
+    fn from_str_uc(s: &'a str) -> Self;
+}
+impl<'a> FromStrUnchecked<'a> for ObjectPath<'a> {
+    fn from_str_uc(s: &'a str) -> Self {
+        <ObjectPath<'a>>::from_str_unchecked(s)
+    }
+}
+
 /// A collection of [`Field`] instances.
 ///
 /// [`Field`]: enum.Field.html
